@@ -7,6 +7,7 @@ type KeyMap struct {
 	Sessions key.Binding
 	Agents   key.Binding
 	Focus    key.Binding
+	Scroll   key.Binding
 	Details  key.Binding
 	Fold     key.Binding
 	Select   key.Binding
@@ -31,6 +32,11 @@ func DefaultKeyMap() KeyMap {
 		Focus: key.NewBinding(
 			key.WithKeys("tab"),
 			key.WithHelp("tab", "focus"),
+		),
+		// Scroll is help text only: the chat's viewport handles the page keys.
+		Scroll: key.NewBinding(
+			key.WithKeys("pgup", "pgdown"),
+			key.WithHelp("pgup/pgdn", "scroll"),
 		),
 		Details: key.NewBinding(
 			key.WithKeys("ctrl+d"),
@@ -60,5 +66,5 @@ func (k KeyMap) FullHelp() [][]key.Binding {
 }
 
 func (k KeyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Quit, k.Sessions, k.Agents, k.Focus, k.Details, k.Fold, k.Select, k.Copy, k.Layout}
+	return []key.Binding{k.Quit, k.Sessions, k.Agents, k.Focus, k.Scroll, k.Details, k.Fold, k.Select, k.Copy, k.Layout}
 }

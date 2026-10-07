@@ -79,6 +79,11 @@ type chatModel struct {
 	historyPending bool
 
 	showInput bool
+	// focused marks the pane the workspace sends keys to.
+	focused bool
+	// scrolledBack is true while the reader has paged up from the newest output;
+	// new output then leaves the view where it is.
+	scrolledBack bool
 }
 
 func newChatModel(agentRef string, sessionID string, send SendMessageFn, verbose bool) *chatModel {
@@ -133,6 +138,9 @@ func (m *chatModel) update(msg tea.Msg) tea.Cmd {
 		m.vp, cmd = m.vp.Update(msg)
 		if cmd != nil {
 			cmds = append(cmds, cmd)
+		}
+		if isKey {
+			m.scrolledBack = !m.vp.AtBottom()
 		}
 	}
 
@@ -261,15 +269,22 @@ func (m *chatModel) View() string {
 	if turn, ok := m.turn.(*streamingTurn); ok && !turn.stopArmedAt.IsZero() {
 		status += "  press esc again to stop listening"
 	}
+	if m.scrolledBack {
+		status = strings.TrimSpace(status + "  scrolled back · pgdn to follow")
+	}
 	if m.mode == modeSelect {
 		status = "select mode · ↑↓ move · enter toggle · o all · y copy · Y copy all · e export · esc back"
 	}
 	if m.note != "" {
 		status = m.note
 	}
+	rule := theme.SeparatorStyle().Render(strings.Repeat("─", max(10, width)))
+	if m.focused {
+		rule = theme.FocusStyle().Render(strings.Repeat("━", max(10, width)))
+	}
 	parts := []string{
 		m.vp.View(),
-		theme.SeparatorStyle().Render(strings.Repeat("─", max(10, width))),
+		rule,
 		theme.StatusStyle().Render(ansi.Truncate(status, width, "…")),
 	}
 	if bottom := m.bottomView(width); bottom != "" {
@@ -313,6 +328,7 @@ func (m *chatModel) layout() {
 
 func (m *chatModel) submit(text string) tea.Cmd {
 	m.log.AddUserMessage(text)
+	m.scrolledBack = false
 	m.render()
 	sessionID := m.sessionID
 	message := protocol.NewMessageWithContext(protocol.MessageRoleUser, []protocol.Part{protocol.NewTextPart(text)}, nil, &sessionID)
@@ -584,6 +600,7 @@ func (m *chatModel) ResetTranscript(title string) {
 	m.title = title
 	m.log = transcript.NewLog()
 	m.folds = transcript.Folds{}
+	m.scrolledBack = false
 	m.render()
 }
 
@@ -594,6 +611,7 @@ func (m *chatModel) SetInputVisible(visible bool) {
 
 // SetFocused moves the cursor into or out of the composer as the pane gains or loses focus.
 func (m *chatModel) SetFocused(focused bool) {
+	m.focused = focused
 	if focused && m.mode == modeCompose {
 		m.input.Focus()
 	} else {
@@ -602,7 +620,8 @@ func (m *chatModel) SetFocused(focused bool) {
 }
 
 // render redraws the viewport at its width; entries wrap themselves.
-// In select mode the viewport follows the cursor instead of the newest entry.
+// The viewport follows the newest entry unless the reader has paged up;
+// in select mode it follows the cursor instead.
 func (m *chatModel) render() {
 	entries := m.log.Entries()
 	m.selected = min(m.selected, max(len(entries)-1, 0))
@@ -623,7 +642,9 @@ func (m *chatModel) render() {
 	}
 	m.vp.SetContent(strings.Join(blocks, "\n\n"))
 	if m.mode != modeSelect {
-		m.vp.GotoBottom()
+		if !m.scrolledBack {
+			m.vp.GotoBottom()
+		}
 		return
 	}
 	switch {
@@ -655,6 +676,7 @@ func (m *chatModel) enterSelect() {
 
 func (m *chatModel) leaveSelect() {
 	m.mode = modeCompose
+	m.scrolledBack = false
 	m.input.Focus()
 	m.render()
 }

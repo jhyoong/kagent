@@ -14,6 +14,7 @@ import (
 
 	api "github.com/kagent-dev/kagent/go/api/httpapi"
 	"github.com/kagent-dev/kagent/go/core/cli/internal/config"
+	"github.com/kagent-dev/kagent/go/core/cli/internal/tui/theme"
 )
 
 // newTestWorkspace is a workspace with an agent and an open session, sized for rendering.
@@ -69,6 +70,23 @@ func TestWorkspaceKeysReachOnlyTheFocusedPane(t *testing.T) {
 
 	assert.False(t, quits(wsPress(m, "q")), "q does not quit from the session list")
 	assert.False(t, quits(wsPress(m, "esc")), "esc does not quit from the session list")
+}
+
+func TestWorkspaceShowsFocus(t *testing.T) {
+	m := newTestWorkspace(t)
+	m.View()
+	assert.Contains(t, ansi.Strip(m.View()), "━━━", "the chat is marked as focused")
+	assert.NotEqual(t, theme.ColorPrimary, m.sessions.Styles.Title.GetBackground())
+
+	wsPress(m, "tab")
+	view := ansi.Strip(m.View())
+	assert.NotContains(t, view, "━━━", "the chat no longer is")
+	assert.Equal(t, theme.ColorPrimary, m.sessions.Styles.Title.GetBackground(), "the session list title is highlighted")
+}
+
+func TestFooterAdvertisesPageKeys(t *testing.T) {
+	m := newTestWorkspace(t)
+	assert.Contains(t, ansi.Strip(m.View()), "pgup/pgdn")
 }
 
 func TestWorkspaceNamingKeepsKeysFromChat(t *testing.T) {

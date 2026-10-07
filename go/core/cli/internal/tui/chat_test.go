@@ -77,6 +77,8 @@ func keyMsg(k string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyCtrlY}
 	case "pgup":
 		return tea.KeyMsg{Type: tea.KeyPgUp}
+	case "pgdown":
+		return tea.KeyMsg{Type: tea.KeyPgDown}
 	}
 	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)}
 }
@@ -193,6 +195,46 @@ func TestComposerKeepsTypedKeys(t *testing.T) {
 		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(chunk)})
 	}
 	assert.Equal(t, "clean up now", m.input.Value(), "a burst chunk that spells a key name is text")
+}
+
+func TestScrolledBackTranscriptStaysPut(t *testing.T) {
+	m, _ := newTestChat(t)
+	for range 40 {
+		m.log.Append(transcript.AgentText{Text: "line"})
+	}
+	startTurn(t, m, "hello")
+	require.True(t, m.vp.AtBottom(), "sending follows the newest entry")
+
+	press(m, "pgup")
+	offset := m.vp.YOffset
+	partial := agentMessage(t, map[string]any{"kind": "text", "text": "Hi "})
+	partial.Metadata = map[string]any{"kagent_adk_partial": true}
+	deliver(m, &protocol.TaskStatusUpdateEvent{TaskID: "task-1", Status: protocol.TaskStatus{State: protocol.TaskStateWorking, Message: partial}})
+	assert.Equal(t, offset, m.vp.YOffset, "a stream event does not pull a scrolled-back reader down")
+	press(m, "ctrl+o")
+	assert.Equal(t, offset, m.vp.YOffset, "neither does folding")
+	assert.Contains(t, screen(m), "scrolled back · pgdn to follow", "the status says new output is below")
+
+	for !m.vp.AtBottom() {
+		press(m, "pgdown")
+	}
+	deliver(m, &protocol.TaskStatusUpdateEvent{TaskID: "task-1", Status: protocol.TaskStatus{State: protocol.TaskStateWorking, Message: agentMessage(t, map[string]any{"kind": "text", "text": "Hi there."})}})
+	assert.True(t, m.vp.AtBottom(), "back at the bottom, the view follows new output again")
+	assert.NotContains(t, screen(m), "scrolled back")
+
+	press(m, "pgup")
+	endOfStream(m)
+	startTurn(t, m, "again")
+	assert.True(t, m.vp.AtBottom(), "sending a message returns to the bottom")
+}
+
+func TestChatShowsFocus(t *testing.T) {
+	m, _ := newTestChat(t)
+	m.SetFocused(true)
+	assert.Contains(t, screen(m), "━━━", "a focused chat draws a heavy rule")
+	m.SetFocused(false)
+	assert.NotContains(t, screen(m), "━━━")
+	assert.Contains(t, screen(m), "───")
 }
 
 func TestEscNeverQuits(t *testing.T) {

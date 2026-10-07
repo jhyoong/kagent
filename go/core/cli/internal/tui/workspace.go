@@ -605,6 +605,7 @@ func (m *workspaceModel) View() string {
 	} else {
 		if len(m.sessions.Items()) > 0 {
 			// We only render sessions sidebar if we have an agent selected AND have sessions
+			m.styleSessions(m.focus == focusSessions)
 			left = lipgloss.NewStyle().Width(sidebarWidth).BorderForeground(theme.ColorBorder).Render(m.sessions.View())
 		}
 	}
@@ -734,6 +735,22 @@ func (m *workspaceModel) View() string {
 		return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, modal)
 	}
 	return content
+}
+
+// styleSessions highlights the session list's title while it has focus and dims its
+// selection while it does not, so tab's effect is visible.
+func (m *workspaceModel) styleSessions(focused bool) {
+	title := list.DefaultStyles().Title
+	delegate := list.NewDefaultDelegate()
+	if focused {
+		title = title.Background(theme.ColorPrimary).Foreground(lipgloss.Color("#FFFFFF"))
+	} else {
+		title = title.UnsetBackground().Foreground(theme.ColorMuted)
+		delegate.Styles.SelectedTitle = delegate.Styles.SelectedTitle.Foreground(theme.ColorMuted).BorderForeground(theme.ColorMuted)
+		delegate.Styles.SelectedDesc = delegate.Styles.SelectedDesc.Foreground(theme.ColorMuted).BorderForeground(theme.ColorMuted)
+	}
+	m.sessions.Styles.Title = title
+	m.sessions.SetDelegate(delegate)
 }
 
 // paneWidths are the sidebar's and details' widths; the select layout hides both.

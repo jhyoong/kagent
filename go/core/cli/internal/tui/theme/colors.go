@@ -43,6 +43,11 @@ func DimStyle() lipgloss.Style {
 	return lipgloss.NewStyle().Foreground(ColorMuted)
 }
 
+// FocusStyle marks the pane that receives keys.
+func FocusStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(ColorPrimary)
+}
+
 // PromptStyle marks a paused turn's prompt heading and cursor.
 func PromptStyle() lipgloss.Style {
 	return lipgloss.NewStyle().Foreground(ColorPrimary).Bold(true)
