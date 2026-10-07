@@ -34,3 +34,13 @@ func StatusStyle() lipgloss.Style {
 func DimStyle() lipgloss.Style {
 	return lipgloss.NewStyle().Foreground(ColorMuted)
 }
+
+// PromptStyle marks a paused turn's prompt heading and cursor.
+func PromptStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(ColorPrimary).Bold(true)
+}
+
+// ReadyStyle marks an approval.
+func ReadyStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(ColorReady)
+}

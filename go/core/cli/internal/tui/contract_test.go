@@ -21,7 +21,7 @@ func TestTUIReachesOnlyV2ControlPlane(t *testing.T) {
 		"client.Model.",
 	}
 
-	for _, dir := range []string{".", "session", "theme", "transcript"} {
+	for _, dir := range []string{".", "hitl", "session", "theme", "transcript"} {
 		sources, err := filepath.Glob(filepath.Join(dir, "*.go"))
 		require.NoError(t, err)
 		require.NotEmpty(t, sources, "no Go sources in %s", dir)

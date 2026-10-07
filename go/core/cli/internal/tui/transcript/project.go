@@ -84,6 +84,17 @@ func ApplyToolActivity(entries []Entry, activity kagenta2a.ToolActivity) []Entry
 // plumbing, and refusals an approval record in the same entries already
 // explains. Callers pass one task or turn: call IDs repeat across turns.
 func Visible(entries []Entry) []Entry {
+	indices := VisibleIndices(entries)
+	visible := make([]Entry, 0, len(indices))
+	for _, i := range indices {
+		visible = append(visible, entries[i])
+	}
+	return visible
+}
+
+// VisibleIndices is Visible as positions in entries, so a caller can follow
+// an entry when a later one makes Visible hide an earlier one.
+func VisibleIndices(entries []Entry) []int {
 	refusedCalls := map[string]struct{}{}
 	refusedNames := map[string]struct{}{}
 	for _, entry := range entries {
@@ -102,8 +113,8 @@ func Visible(entries []Entry) []Entry {
 			}
 		}
 	}
-	visible := make([]Entry, 0, len(entries))
-	for _, entry := range entries {
+	indices := make([]int, 0, len(entries))
+	for i, entry := range entries {
 		if tool, ok := entry.(ToolActivity); ok {
 			if tool.Name == askUserTool {
 				continue
@@ -114,9 +125,9 @@ func Visible(entries []Entry) []Entry {
 				continue
 			}
 		}
-		visible = append(visible, entry)
+		indices = append(indices, i)
 	}
-	return visible
+	return indices
 }
 
 // tool is the requested tool a decision ID refers to, when the request was in view.

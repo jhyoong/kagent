@@ -14,7 +14,6 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/kagent-dev/kagent/go/api/client"
 	apiv1alpha1 "github.com/kagent-dev/kagent/go/api/gen/kagent/api/v1alpha1"
-	clia2a "github.com/kagent-dev/kagent/go/core/cli/internal/a2a"
 	sessionview "github.com/kagent-dev/kagent/go/core/cli/internal/tui/session"
 	"github.com/kagent-dev/kagent/go/core/cli/internal/tui/theme"
 	"github.com/kagent-dev/kagent/go/core/internal/version"
@@ -73,7 +72,9 @@ type sessionSelectedMsg struct{ session *apiv1alpha1.Session }
 type sessionHistoryLoadedMsg struct {
 	sessionID string
 	tasks     []*a2atype.Task
-	err       error
+	// pending is the task waiting for the user's input, if the session holds one.
+	pending *a2atype.Task
+	err     error
 }
 
 // catalogLoadedMsg carries Kubernetes names; on error the cascade falls back to session-derived ones.
@@ -205,7 +206,9 @@ func (m *workspaceModel) loadSessions() tea.Cmd {
 	}
 }
 
-// loadHistory preserves the durable task order returned by the gateway.
+// loadHistory preserves the durable task order returned by the gateway, and finds
+// the request the session is holding. History is the oldest tasks, so it may not
+// include the paused one; a session holds at most one, so one more query finds it.
 func (m *workspaceModel) loadHistory(session *apiv1alpha1.Session) tea.Cmd {
 	id := session.GetId()
 	return func() tea.Msg {
@@ -223,7 +226,21 @@ func (m *workspaceModel) loadHistory(session *apiv1alpha1.Session) tea.Cmd {
 		if err != nil {
 			return sessionHistoryLoadedMsg{sessionID: id, err: err}
 		}
-		return sessionHistoryLoadedMsg{sessionID: id, tasks: response.Tasks}
+		waiting, err := a2aClient.ListTasks(m.ctx, &a2atype.ListTasksRequest{
+			ContextID:        session.GetId(),
+			Status:           a2atype.TaskStateInputRequired,
+			PageSize:         1,
+			HistoryLength:    &historyLength,
+			IncludeArtifacts: true,
+		})
+		if err != nil {
+			return sessionHistoryLoadedMsg{sessionID: id, tasks: response.Tasks, err: fmt.Errorf("failed to read the pending request: %w", err)}
+		}
+		var pending *a2atype.Task
+		if len(waiting.Tasks) > 0 {
+			pending = waiting.Tasks[0]
+		}
+		return sessionHistoryLoadedMsg{sessionID: id, tasks: response.Tasks, pending: pending}
 	}
 }
 
@@ -257,13 +274,18 @@ func (m *workspaceModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.sessionID != m.current.GetId() || m.chat == nil {
 			return m, nil // the user selected something else while this was in flight
 		}
+		m.chat.historyPending = false
 		if msg.err != nil {
+			// The pending query fails after history has loaded; show what was read.
 			m.status = fmt.Sprintf("Failed to load history: %v", msg.err)
-			return m, nil
 		}
 		for _, task := range msg.tasks {
-			m.chat.appendHistoryTask(task)
+			// The paused task is the current turn, not history.
+			if msg.pending == nil || task == nil || task.ID != msg.pending.ID {
+				m.chat.appendHistoryTask(task)
+			}
 		}
+		m.chat.restorePending(msg.pending)
 		// Tasks are sorted oldest first, so the last is the most recent thing this session did.
 		if last := len(msg.tasks) - 1; last >= 0 && msg.tasks[last] != nil && msg.tasks[last].Status.Timestamp != nil {
 			m.chat.setHeaderMeta(stateBadge(m.current.GetState()), *msg.tasks[last].Status.Timestamp)
@@ -285,7 +307,7 @@ func (m *workspaceModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	// Stream and timer messages go to the chat wherever focus is, or a reply is stranded.
-	case clia2a.StreamResult, streamDoneMsg, spinner.TickMsg, tickMsg, cancelDisarmMsg, cancelResultMsg:
+	case streamMsg, streamDoneMsg, spinner.TickMsg, tickMsg, cancelDisarmMsg, cancelResultMsg, discardResultMsg:
 		if m.chat == nil {
 			return m, nil
 		}
@@ -563,6 +585,7 @@ func (m *workspaceModel) selectSession(session *apiv1alpha1.Session) tea.Cmd {
 	}
 
 	m.chat = newChatModel(m.ctx, session.GetAgent().GetName(), session.GetId(), a2aClient, m.verbose)
+	m.chat.historyPending = true
 	m.chat.setHeaderMeta(stateBadge(session.GetState()), session.GetUpdatedAt().AsTime())
 	// Bubble Tea calls Init only on the root model, so start the chat's here.
 	return tea.Batch(m.chat.Init(), m.resize(), m.loadHistory(session))

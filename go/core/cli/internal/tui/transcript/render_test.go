@@ -263,3 +263,29 @@ func TestFolds(t *testing.T) {
 	folds.Toggle(0)
 	assert.True(t, folds.Expanded(0), "flipping twice restores")
 }
+
+func TestFoldsRemap(t *testing.T) {
+	var folds Folds
+	folds.Toggle(1)
+	folds.Toggle(3)
+
+	// Entry 1 is gone; entries 2 and 3 move up one.
+	folds.Remap(func(old int) (int, bool) {
+		if old == 1 {
+			return 0, false
+		}
+		if old > 1 {
+			return old - 1, true
+		}
+		return old, true
+	})
+
+	assert.False(t, folds.Expanded(0))
+	assert.False(t, folds.Expanded(1))
+	assert.True(t, folds.Expanded(2), "the flip follows its entry")
+	assert.False(t, folds.Expanded(3))
+
+	folds.ToggleAll()
+	folds.Remap(func(old int) (int, bool) { return old + 1, true })
+	assert.True(t, folds.Expanded(0), "the default is not an index")
+}

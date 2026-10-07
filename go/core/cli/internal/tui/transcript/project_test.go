@@ -365,6 +365,12 @@ func TestVisible(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.want, Visible(tt.entries))
+			indices := VisibleIndices(tt.entries)
+			shown := make([]Entry, 0, len(indices))
+			for _, i := range indices {
+				shown = append(shown, tt.entries[i])
+			}
+			assert.Equal(t, tt.want, shown, "VisibleIndices names the same entries")
 		})
 	}
 }

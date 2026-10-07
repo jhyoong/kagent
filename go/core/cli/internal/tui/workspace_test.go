@@ -9,6 +9,7 @@ import (
 
 	a2atype "github.com/a2aproject/a2a-go/v2/a2a"
 	tea "github.com/charmbracelet/bubbletea"
+	kagenta2a "github.com/kagent-dev/kagent/go/api/a2a"
 	apiv1alpha1 "github.com/kagent-dev/kagent/go/api/gen/kagent/api/v1alpha1"
 	clia2a "github.com/kagent-dev/kagent/go/core/cli/internal/a2a"
 	"github.com/kagent-dev/kagent/go/core/cli/internal/connection"
@@ -546,7 +547,7 @@ func TestWorkspaceRoutesStreamMessagesRegardlessOfFocus(t *testing.T) {
 	m.chat.submit("hi")
 	m.focus = panelSessions
 
-	m.Update(clia2a.StreamResult{Err: errors.New("stream disconnected")})
+	m.Update(streamMsg{gen: m.chat.streamGen, result: clia2a.StreamResult{Err: errors.New("stream disconnected")}})
 
 	assert.Contains(t, shownText(m.chat), "Connection error")
 }
@@ -687,7 +688,7 @@ func TestWorkspaceDoubleEscCancelsTheRunningTurn(t *testing.T) {
 	client := &fakeTurnClient{cancelErr: errors.New("boom")}
 	m.chat.client = client
 	m.chat.submit("hi")
-	m.Update(clia2a.StreamResult{Event: a2atype.NewStatusUpdateEvent(reqCtx(), a2atype.TaskStateWorking, nil)})
+	m.Update(streamMsg{gen: m.chat.streamGen, result: clia2a.StreamResult{Event: a2atype.NewStatusUpdateEvent(reqCtx(), a2atype.TaskStateWorking, nil)}})
 	assert.Contains(t, m.footerView(), "cancel: esc esc")
 
 	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
@@ -713,6 +714,76 @@ func TestWorkspaceConsumedKeyDisarmsCancel(t *testing.T) {
 	m.Update(tea.KeyMsg{Type: tea.KeyCtrlO})
 
 	assert.True(t, m.chat.turn.(*streamingTurn).cancelArmedAt.IsZero())
+}
+
+// Reopening a session that holds a request shows its prompt, and the paused task once.
+func TestWorkspaceRestoresThePendingRequest(t *testing.T) {
+	m := openedChat(t)
+	message := a2atype.NewMessage(a2atype.MessageRoleAgent, a2atype.NewTextPart("approve?"))
+	require.NoError(t, kagenta2a.AttachHITL(message, kagenta2a.ToolApprovalRequest{
+		Type: kagenta2a.HITLTypeToolApprovalRequest, Tools: []kagenta2a.HITLTool{{ID: "approval-1", Name: "k8s_delete_pod"}},
+	}))
+	paused := &a2atype.Task{
+		ID: "task-2", ContextID: "a",
+		Status:  a2atype.TaskStatus{State: a2atype.TaskStateInputRequired, Message: message},
+		History: []*a2atype.Message{a2atype.NewMessage(a2atype.MessageRoleUser, a2atype.NewTextPart("delete the pod"))},
+	}
+	done := historyTask("task-1", []*a2atype.Message{a2atype.NewMessage(a2atype.MessageRoleUser, a2atype.NewTextPart("hello"))})
+
+	m.Update(sessionHistoryLoadedMsg{sessionID: "a", tasks: []*a2atype.Task{done, paused}, pending: paused})
+
+	assert.Contains(t, m.chat.View(), "asking permission to run 1 tool")
+	assert.Equal(t, 1, strings.Count(shownText(m.chat), "delete the pod"), "the paused task is shown once")
+	assert.Less(t, strings.Index(shownText(m.chat), "hello"), strings.Index(shownText(m.chat), "delete the pod"))
+	_, awaiting := m.chat.turn.(*awaitingTurn)
+	assert.True(t, awaiting)
+}
+
+// A pending query that fails still shows the history it could read.
+func TestWorkspaceHistoryWithAFailedPendingQuery(t *testing.T) {
+	m := openedChat(t)
+	done := historyTask("task-1", []*a2atype.Message{a2atype.NewMessage(a2atype.MessageRoleUser, a2atype.NewTextPart("hello"))})
+
+	m.Update(sessionHistoryLoadedMsg{sessionID: "a", tasks: []*a2atype.Task{done}, err: errors.New("unavailable")})
+
+	assert.Contains(t, shownText(m.chat), "hello")
+	assert.Contains(t, m.status, "unavailable")
+}
+
+func TestWorkspaceRoutesDiscardResultsRegardlessOfFocus(t *testing.T) {
+	m := openedChat(t)
+	client := &fakeTurnClient{}
+	m.chat.client = client
+	m.chat.submit("hi")
+	message := a2atype.NewMessage(a2atype.MessageRoleAgent, a2atype.NewTextPart("waiting"))
+	m.Update(streamMsg{gen: m.chat.streamGen, result: clia2a.StreamResult{Event: a2atype.NewStatusUpdateEvent(reqCtx(), a2atype.TaskStateInputRequired, message)}})
+	m.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	_, cmd := m.Update(runes("y"))
+	m.focus = panelSessions
+
+	for _, msg := range runCmd(cmd) {
+		m.Update(msg)
+	}
+
+	assert.Equal(t, []a2atype.TaskID{"task-1"}, client.cancels)
+	assert.Contains(t, shownText(m.chat), "Discarded the request")
+}
+
+// An early send would race the restored request, so the workspace holds sends until history arrives.
+func TestWorkspaceHoldsSendsUntilHistoryLoads(t *testing.T) {
+	m := openedChat(t)
+	client := &fakeTurnClient{}
+	m.chat.client = client
+	m.chat.input.SetValue("hello")
+	require.True(t, m.chat.historyPending)
+
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	assert.Empty(t, client.sent)
+
+	m.Update(sessionHistoryLoadedMsg{sessionID: "a", err: errors.New("unavailable")})
+	assert.False(t, m.chat.historyPending, "a failed load still releases the composer")
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	assert.Len(t, client.sent, 1)
 }
 
 // With no chat open the empty pane tells the user to pick another panel, so digits must work.

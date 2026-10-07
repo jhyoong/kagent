@@ -119,3 +119,18 @@ func (f *Folds) ToggleAll() {
 	f.all = !f.all
 	f.flipped = nil
 }
+
+// Remap moves individual flips to their entries' new positions; a flip whose
+// entry is gone (ok false) is forgotten. The default is not positional.
+func (f *Folds) Remap(to func(old int) (int, bool)) {
+	if len(f.flipped) == 0 {
+		return
+	}
+	flipped := make(map[int]struct{}, len(f.flipped))
+	for old := range f.flipped {
+		if moved, ok := to(old); ok {
+			flipped[moved] = struct{}{}
+		}
+	}
+	f.flipped = flipped
+}

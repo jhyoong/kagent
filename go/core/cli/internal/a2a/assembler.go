@@ -16,6 +16,12 @@ type Assembler struct {
 	task    *a2atype.Task
 }
 
+// ResumeAssembler continues a paused task: events of the resumed turn apply to
+// it, so output from before the pause is not reported again.
+func ResumeAssembler(paused *a2atype.Task) *Assembler {
+	return &Assembler{task: paused}
+}
+
 // Apply incorporates one A2A event into the assembled result.
 func (a *Assembler) Apply(event a2atype.Event) error {
 	if event == nil {

@@ -66,3 +66,27 @@ func TestPartsTextSerializesStructuredOutput(t *testing.T) {
 	require.NoError(t, err)
 	require.JSONEq(t, `{"answer":4}`, text)
 }
+
+// A resumed task continues from where it paused, so its earlier output is not new.
+func TestResumeAssemblerContinuesThePausedTask(t *testing.T) {
+	paused := &a2atype.Task{
+		ID: "task-1", ContextID: "session-1",
+		Status:    a2atype.TaskStatus{State: a2atype.TaskStateInputRequired},
+		Artifacts: []*a2atype.Artifact{{ID: "before", Parts: a2atype.ContentParts{a2atype.NewTextPart("before")}}},
+	}
+	assembler := ResumeAssembler(paused)
+
+	require.NoError(t, assembler.Apply(&a2atype.TaskArtifactUpdateEvent{
+		TaskID: "task-1", ContextID: "session-1",
+		Artifact: &a2atype.Artifact{ID: "after", Parts: a2atype.ContentParts{a2atype.NewTextPart("after")}},
+	}))
+
+	result, ok := assembler.Result().(*a2atype.Task)
+	require.True(t, ok)
+	require.Len(t, result.Artifacts, 2)
+	assert.Equal(t, "before", result.Artifacts[0].Parts[0].Text())
+	assert.Len(t, paused.Artifacts, 1, "the paused task is not modified")
+	assert.Error(t, ResumeAssembler(paused).Apply(&a2atype.TaskStatusUpdateEvent{
+		TaskID: "task-2", ContextID: "session-1", Status: a2atype.TaskStatus{State: a2atype.TaskStateWorking},
+	}), "another task's events do not apply")
+}
