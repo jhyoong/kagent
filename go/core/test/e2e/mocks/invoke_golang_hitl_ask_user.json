@@ -61,6 +61,32 @@
           }
         ]
       }
+    },
+    {
+      "name": "after_discard",
+      "match": {
+        "match_type": "contains",
+        "message": {
+          "content": "Say hello after the discard.",
+          "role": "user"
+        }
+      },
+      "response": {
+        "id": "chatcmpl-hitl-ask-3",
+        "object": "chat.completion",
+        "created": 1677652290,
+        "model": "gpt-4.1-mini",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "Hello after the discard."
+            },
+            "finish_reason": "stop"
+          }
+        ]
+      }
     }
   ]
 }

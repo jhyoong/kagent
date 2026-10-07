@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2aclient"
 	a2apb "github.com/a2aproject/a2a-go/v2/a2apb/v1"
 	"github.com/a2aproject/a2a-go/v2/a2apb/v1/pbconv"
+	"github.com/kagent-dev/kagent/go/api/a2a"
 	apiv1alpha1 "github.com/kagent-dev/kagent/go/api/gen/kagent/api/v1alpha1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -45,6 +47,7 @@ type a2aCallObservation struct {
 	id            string
 	userID        string
 	authorization string
+	extensions    []string
 	hasDeadline   bool
 }
 
@@ -77,6 +80,21 @@ func (s *recordingA2AService) SubscribeToTask(req *a2apb.SubscribeToTaskRequest,
 	return stream.Send(response)
 }
 
+func (s *recordingA2AService) ListTasks(ctx context.Context, req *a2apb.ListTasksRequest) (*a2apb.ListTasksResponse, error) {
+	s.observe(ctx, req.Tenant, req.ContextId)
+	return &a2apb.ListTasksResponse{}, nil
+}
+
+func (s *recordingA2AService) CancelTask(ctx context.Context, req *a2apb.CancelTaskRequest) (*a2apb.Task, error) {
+	s.observe(ctx, req.Tenant, "")
+	return &a2apb.Task{Id: req.Id, Status: &a2apb.TaskStatus{State: a2apb.TaskState_TASK_STATE_CANCELED}}, nil
+}
+
+func (s *recordingA2AService) GetTask(ctx context.Context, req *a2apb.GetTaskRequest) (*a2apb.Task, error) {
+	s.observe(ctx, req.Tenant, "")
+	return &a2apb.Task{Id: req.Id, Status: &a2apb.TaskStatus{State: a2apb.TaskState_TASK_STATE_CANCELED}}, nil
+}
+
 func (s *recordingA2AService) observe(ctx context.Context, tenant, contextID string) {
 	values, _ := metadata.FromIncomingContext(ctx)
 	_, hasDeadline := ctx.Deadline()
@@ -87,6 +105,7 @@ func (s *recordingA2AService) observe(ctx context.Context, tenant, contextID str
 		contextID:     contextID,
 		userID:        first(values.Get(userIDHeader)),
 		authorization: first(values.Get("authorization")),
+		extensions:    values.Get(strings.ToLower(a2atype.SvcParamExtensions)),
 		hasDeadline:   hasDeadline,
 	})
 }
@@ -142,11 +161,12 @@ func TestSessionAndA2AClientsUseTheirEndpoints(t *testing.T) {
 		require.NoError(t, streamErr)
 	}
 
+	hitl := []string{a2a.HITLExtensionURI}
 	a2aService.mu.Lock()
 	require.Equal(t, []a2aCallObservation{
-		{id: "team-a/assistant", userID: "caller", authorization: "Bearer model-key", hasDeadline: true},
-		{id: "team-a/assistant", userID: "caller", authorization: "Bearer model-key", hasDeadline: false},
-		{id: "team-a/assistant", userID: "caller", authorization: "Bearer model-key", hasDeadline: false},
+		{id: "team-a/assistant", userID: "caller", authorization: "Bearer model-key", extensions: hitl, hasDeadline: true},
+		{id: "team-a/assistant", userID: "caller", authorization: "Bearer model-key", extensions: hitl, hasDeadline: false},
+		{id: "team-a/assistant", userID: "caller", authorization: "Bearer model-key", extensions: hitl, hasDeadline: false},
 	}, a2aService.observations)
 	a2aService.mu.Unlock()
 	sessionClient, err := gatewayClient.A2A.ForSession(context.Background(), sessionClientTestID)
@@ -158,6 +178,31 @@ func TestSessionAndA2AClientsUseTheirEndpoints(t *testing.T) {
 	require.Equal(t, "team-a/assistant", a2aService.observations[3].id)
 	a2aService.mu.Unlock()
 	assert.Equal(t, int32(2), dialCount.Load())
+
+	// Every other call also opts in, and existing extension values are kept.
+	extCtx := a2aclient.AttachServiceParams(context.Background(), a2aclient.ServiceParams{
+		a2atype.SvcParamExtensions: {"https://example.com/other"},
+	})
+	_, err = sessionClient.ListTasks(extCtx, &a2atype.ListTasksRequest{})
+	require.NoError(t, err)
+	_, err = sessionClient.CancelTask(extCtx, &a2atype.CancelTaskRequest{ID: "task-id"})
+	require.NoError(t, err)
+	_, err = sessionClient.GetTask(context.Background(), &a2atype.GetTaskRequest{ID: "task-id"})
+	require.NoError(t, err)
+	// A caller that already opted in is not given the URI twice.
+	optedIn := a2aclient.AttachServiceParams(context.Background(), a2aclient.ServiceParams{
+		a2atype.SvcParamExtensions: {a2a.HITLExtensionURI},
+	})
+	_, err = sessionClient.GetTask(optedIn, &a2atype.GetTaskRequest{ID: "task-id"})
+	require.NoError(t, err)
+	a2aService.mu.Lock()
+	defer a2aService.mu.Unlock()
+	require.Len(t, a2aService.observations, 8)
+	assert.Equal(t, hitl, a2aService.observations[7].extensions)
+	assert.Equal(t, hitl, a2aService.observations[3].extensions)
+	assert.Equal(t, []string{"https://example.com/other", a2a.HITLExtensionURI}, a2aService.observations[4].extensions)
+	assert.Equal(t, []string{"https://example.com/other", a2a.HITLExtensionURI}, a2aService.observations[5].extensions)
+	assert.Equal(t, hitl, a2aService.observations[6].extensions)
 }
 
 func TestStreamingA2AMethodsMatchUpstreamService(t *testing.T) {

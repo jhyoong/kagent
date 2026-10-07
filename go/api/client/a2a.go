@@ -9,6 +9,7 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2aclient"
 	a2agrpc "github.com/a2aproject/a2a-go/v2/a2agrpc/v1"
 	a2apb "github.com/a2aproject/a2a-go/v2/a2apb/v1"
+	"github.com/kagent-dev/kagent/go/api/a2a"
 	apiv1alpha1 "github.com/kagent-dev/kagent/go/api/gen/kagent/api/v1alpha1"
 )
 
@@ -89,6 +90,9 @@ func (i *agentRoutingInterceptor) Before(ctx context.Context, request *a2aclient
 			}
 		}
 	}
+	// Opt in on every call: the agent only resumes parked HITL tasks, and only
+	// emits resumable requests, when the extension is activated on the call.
+	request.ServiceParams.Append(a2atype.SvcParamExtensions, a2a.HITLExtensionURI)
 	if i.userID != "" {
 		request.ServiceParams.Append(userIDHeader, i.userID)
 	}

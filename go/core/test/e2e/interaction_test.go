@@ -21,12 +21,13 @@ import (
 	"time"
 
 	a2atype "github.com/a2aproject/a2a-go/v2/a2a"
-	a2agrpc "github.com/a2aproject/a2a-go/v2/a2agrpc/v1"
+	"github.com/a2aproject/a2a-go/v2/a2aclient"
 	a2apb "github.com/a2aproject/a2a-go/v2/a2apb/v1"
 	"github.com/a2aproject/a2a-go/v2/a2apb/v1/pbconv"
 	"github.com/google/uuid"
 	adka2a "github.com/kagent-dev/kagent/go/adk/pkg/a2a"
 	kagenta2a "github.com/kagent-dev/kagent/go/api/a2a"
+	kagentclient "github.com/kagent-dev/kagent/go/api/client"
 	apiv1alpha1 "github.com/kagent-dev/kagent/go/api/gen/kagent/api/v1alpha1"
 	"github.com/kagent-dev/kagent/go/api/v1alpha3"
 	kagentenv "github.com/kagent-dev/kagent/go/core/pkg/env"
@@ -153,8 +154,9 @@ func TestSessionAskUserSurvivesSuspension(t *testing.T) {
 			t.Skip("native ask-user model fixtures are not available yet; this fixture calls the Go ADK ask_user tool")
 		}
 		fixture := newInteractionFixture(t, harness, interactionTarget(t), startMockLLM(t, "mocks/invoke_golang_hitl_ask_user.json"))
-		fixture.ctx = metadata.AppendToOutgoingContext(fixture.ctx, strings.ToLower(a2atype.SvcParamExtensions), adka2a.HITLExtensionURI)
-		_, _, waiting := fixture.send(t, "Which database should we use for storage?")
+		// The client opts in to the HITL extension on every call; nothing is set by hand here.
+		client := fixture.a2aClient(t)
+		waiting := fixture.sendWithClient(t, client, a2atype.NewMessage(a2atype.MessageRoleUser, a2atype.NewTextPart("Which database should we use for storage?")))
 		if waiting.Status.State != a2atype.TaskStateInputRequired {
 			t.Fatalf("A2A task state = %s, want INPUT_REQUIRED", waiting.Status.State)
 		}
@@ -167,21 +169,54 @@ func TestSessionAskUserSurvivesSuspension(t *testing.T) {
 			Answers: []kagenta2a.AskUserAnswer{{Answer: []string{"PostgreSQL"}}},
 		})
 		reply.TaskID, reply.ContextID = waiting.ID, waiting.ContextID
-		response, err := a2agrpc.NewGRPCTransportFromClient(fixture.client).SendMessage(fixture.ctx, nil, &a2atype.SendMessageRequest{Tenant: fixture.tenant, Message: reply})
-		if err != nil {
-			t.Fatalf("resume A2A task: %v", err)
+		completed := fixture.sendWithClient(t, client, reply)
+		if completed.Status.State != a2atype.TaskStateCompleted || !strings.Contains(taskText(completed), "Using PostgreSQL") {
+			t.Fatalf("resumed A2A task = %#v, want completed PostgreSQL response", completed)
 		}
-		completed, ok := response.(*a2atype.Task)
-		if !ok || completed.Status.State != a2atype.TaskStateCompleted || !strings.Contains(taskText(completed), "Using PostgreSQL") {
-			t.Fatalf("resumed A2A task = %#v, want completed PostgreSQL response", response)
+	})
+}
+
+// TestSessionParkedTaskCanBeDiscarded verifies that a parked HITL task can be
+// canceled through the client and that the session then accepts a new message.
+func TestSessionParkedTaskCanBeDiscarded(t *testing.T) {
+	t.Parallel()
+	forEachHarness(t, func(t *testing.T, harness testHarness) {
+		t.Parallel()
+		switch harness.name {
+		case codexE2EHarness, claudeE2EHarness:
+			t.Skip("native ask-user model fixtures are not available yet; this fixture calls the Go ADK ask_user tool")
+		}
+		fixture := newInteractionFixture(t, harness, interactionTarget(t), startMockLLM(t, "mocks/invoke_golang_hitl_ask_user.json"))
+		client := fixture.a2aClient(t)
+		prompt := "Which database should we use for storage?"
+		parked := fixture.sendWithClient(t, client, a2atype.NewMessage(a2atype.MessageRoleUser, a2atype.NewTextPart(prompt)))
+		if parked.Status.State != a2atype.TaskStateInputRequired {
+			t.Fatalf("A2A task state = %s, want INPUT_REQUIRED", parked.Status.State)
+		}
+		canceled, err := client.CancelTask(fixture.ctx, &a2atype.CancelTaskRequest{ID: parked.ID})
+		if err != nil {
+			t.Fatalf("cancel parked task: %v", err)
+		}
+		if canceled.ID != parked.ID || canceled.Status.State != a2atype.TaskStateCanceled {
+			t.Fatalf("canceled task %s state = %s, want task %s in CANCELED", canceled.ID, canceled.Status.State, parked.ID)
+		}
+		// A distinct prompt the mock LLM completes proves the session processes
+		// new work after the discard, rather than parking on the old question again.
+		next := fixture.sendWithClient(t, client, a2atype.NewMessage(a2atype.MessageRoleUser, a2atype.NewTextPart("Say hello after the discard.")))
+		if next.ID == parked.ID {
+			t.Fatalf("new message reused discarded task %s", parked.ID)
+		}
+		if next.Status.State != a2atype.TaskStateCompleted || !strings.Contains(taskText(next), "Hello after the discard.") {
+			t.Fatalf("task after discard state = %s, text = %q, want COMPLETED with the mock answer", next.Status.State, taskText(next))
 		}
 	})
 }
 
 func sendApprovedToolRequest(t *testing.T, fixture *interactionFixture, prompt, wantTool string) *a2atype.Task {
 	t.Helper()
-	fixture.ctx = metadata.AppendToOutgoingContext(fixture.ctx, strings.ToLower(a2atype.SvcParamExtensions), kagenta2a.HITLExtensionURI)
-	_, _, waiting := fixture.send(t, prompt)
+	// The client opts in to the HITL extension on every call; nothing is set by hand here.
+	client := fixture.a2aClient(t)
+	waiting := fixture.sendWithClient(t, client, a2atype.NewMessage(a2atype.MessageRoleUser, a2atype.NewTextPart(prompt)))
 	if waiting.Status.State != a2atype.TaskStateInputRequired {
 		t.Fatalf("A2A task state = %s, want INPUT_REQUIRED", waiting.Status.State)
 	}
@@ -207,14 +242,7 @@ func sendApprovedToolRequest(t *testing.T, fixture *interactionFixture, prompt, 
 	}); err != nil {
 		t.Fatalf("attach tool approval response: %v", err)
 	}
-	response, err := a2agrpc.NewGRPCTransportFromClient(fixture.client).SendMessage(fixture.ctx, nil, &a2atype.SendMessageRequest{Tenant: fixture.tenant, Message: reply})
-	if err != nil {
-		t.Fatalf("resume A2A task after tool approval: %v", err)
-	}
-	completed, ok := response.(*a2atype.Task)
-	if !ok {
-		t.Fatalf("resumed A2A response = %T, want Task", response)
-	}
+	completed := fixture.sendWithClient(t, client, reply)
 	if completed.ID != waiting.ID || completed.ContextID != waiting.ContextID {
 		t.Fatalf("resumed task = %s/%s, want %s/%s", completed.ContextID, completed.ID, waiting.ContextID, waiting.ID)
 	}
@@ -627,6 +655,7 @@ type interactionFixture struct {
 	sessionID   string
 	contextID   string
 	tenant      string
+	target      string
 }
 
 type sharedInteractionFixture struct {
@@ -704,7 +733,43 @@ func newInteractionFixtureForHarnessTemplate(t *testing.T, target, harnessName, 
 		system:      apiv1alpha1.NewSystemServiceClient(conn),
 		sessionID:   session.GetId(),
 		contextID:   session.GetContextId(),
+		target:      target,
 	}
+}
+
+// a2aClient returns the shared client bound to the fixture's session. Tests use
+// it, instead of the raw gRPC stub, to prove the client opts in to HITL.
+func (f *interactionFixture) a2aClient(t *testing.T) *a2aclient.Client {
+	t.Helper()
+	gateway, err := kagentclient.NewGateway("http://" + f.target)
+	if err != nil {
+		t.Fatalf("create gateway client: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := gateway.Close(); err != nil {
+			t.Errorf("close gateway client: %v", err)
+		}
+	})
+	client, err := gateway.A2A.ForSession(f.ctx, f.sessionID)
+	if err != nil {
+		t.Fatalf("create session A2A client: %v", err)
+	}
+	return client
+}
+
+// sendWithClient sends one message through client and requires a Task result.
+// The user identity comes from the fixture context's x-user-id metadata.
+func (f *interactionFixture) sendWithClient(t *testing.T, client *a2aclient.Client, message *a2atype.Message) *a2atype.Task {
+	t.Helper()
+	result, err := client.SendMessage(f.ctx, &a2atype.SendMessageRequest{Message: message})
+	if err != nil {
+		t.Fatalf("send A2A message through client: %v", err)
+	}
+	task, ok := result.(*a2atype.Task)
+	if !ok {
+		t.Fatalf("A2A response = %T, want Task", result)
+	}
+	return task
 }
 
 // Completion is public before automatic suspension finishes. Cleanup retries
