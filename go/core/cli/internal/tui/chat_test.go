@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"iter"
 	"strings"
 	"testing"
+	"time"
 
 	a2atype "github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
@@ -17,13 +19,39 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func newTestChatModel() *chatModel {
-	send := func(context.Context, *a2atype.SendMessageRequest) <-chan clia2a.StreamResult {
-		ch := make(chan clia2a.StreamResult)
-		close(ch)
-		return ch
+// fakeTurnClient records what a chat asks of the session; its stream ends at once,
+// so tests feed events through Update or streamEvent.
+type fakeTurnClient struct {
+	streamCtx context.Context
+	sent      []*a2atype.SendMessageRequest
+	cancels   []a2atype.TaskID
+	cancelErr error
+}
+
+func (f *fakeTurnClient) SendStreamingMessage(ctx context.Context, req *a2atype.SendMessageRequest) iter.Seq2[a2atype.Event, error] {
+	f.streamCtx = ctx
+	f.sent = append(f.sent, req)
+	return func(func(a2atype.Event, error) bool) {}
+}
+
+func (f *fakeTurnClient) CancelTask(_ context.Context, req *a2atype.CancelTaskRequest) (*a2atype.Task, error) {
+	f.cancels = append(f.cancels, req.ID)
+	if f.cancelErr != nil {
+		return nil, f.cancelErr
 	}
-	return newChatModel(context.Background(), "reporter", "ctx-1", send, false)
+	return &a2atype.Task{ID: req.ID, Status: a2atype.TaskStatus{State: a2atype.TaskStateCanceled}}, nil
+}
+
+func newTestChatModel() *chatModel {
+	return newChatModel(context.Background(), "reporter", "ctx-1", &fakeTurnClient{}, false)
+}
+
+// streamEvent applies an event to the running turn, starting one if the chat is idle.
+func streamEvent(m *chatModel, ev a2atype.Event) {
+	if !m.isStreaming() {
+		m.startStream(a2atype.NewMessage(a2atype.MessageRoleUser, a2atype.NewTextPart("hi")))
+	}
+	m.appendEvent(ev)
 }
 
 // shownText is the visible transcript as plain text, including the block being assembled.
@@ -97,7 +125,7 @@ func TestChatModelStreamsAssembledText(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			model := newTestChatModel()
 			for _, event := range tt.events() {
-				model.appendEvent(event)
+				streamEvent(model, event)
 			}
 
 			assert.Contains(t, shownText(model), tt.want)
@@ -113,18 +141,20 @@ func TestChatModelRendersStateClasses(t *testing.T) {
 		apply      func(*chatModel)
 		want       string
 		wantAbsent string
+		// stillWorking: the stream has not settled the task, so the turn keeps running.
+		stillWorking bool
 	}{
 		{
 			name: "input required is paused",
 			apply: func(m *chatModel) {
-				m.appendEvent(a2atype.NewStatusUpdateEvent(reqCtx(), a2atype.TaskStateInputRequired, nil))
+				streamEvent(m, a2atype.NewStatusUpdateEvent(reqCtx(), a2atype.TaskStateInputRequired, nil))
 			},
 			want: "Input required", wantAbsent: "✗",
 		},
 		{
 			name: "auth required is paused",
 			apply: func(m *chatModel) {
-				m.appendEvent(a2atype.NewStatusUpdateEvent(reqCtx(), a2atype.TaskStateAuthRequired, nil))
+				streamEvent(m, a2atype.NewStatusUpdateEvent(reqCtx(), a2atype.TaskStateAuthRequired, nil))
 			},
 			want: "Authentication required", wantAbsent: "✗",
 		},
@@ -132,20 +162,21 @@ func TestChatModelRendersStateClasses(t *testing.T) {
 			name: "failed is an error and keeps its explanation",
 			apply: func(m *chatModel) {
 				message := a2atype.NewMessage(a2atype.MessageRoleAgent, a2atype.NewTextPart("execution failed"))
-				m.appendEvent(a2atype.NewStatusUpdateEvent(reqCtx(), a2atype.TaskStateFailed, message))
+				streamEvent(m, a2atype.NewStatusUpdateEvent(reqCtx(), a2atype.TaskStateFailed, message))
 			},
 			want: "execution failed",
 		},
 		{
 			name: "completed needs no banner",
 			apply: func(m *chatModel) {
-				m.appendEvent(a2atype.NewStatusUpdateEvent(reqCtx(), a2atype.TaskStateCompleted, nil))
+				streamEvent(m, a2atype.NewStatusUpdateEvent(reqCtx(), a2atype.TaskStateCompleted, nil))
 			},
 			wantAbsent: "✗",
 		},
 		{
 			name: "a transport failure is not a task failure",
 			apply: func(m *chatModel) {
+				m.submit("hi")
 				m.Update(clia2a.StreamResult{Err: errors.New("stream disconnected")})
 			},
 			want: "Connection error: stream disconnected", wantAbsent: "✗ Task",
@@ -154,10 +185,10 @@ func TestChatModelRendersStateClasses(t *testing.T) {
 			// A malformed stream is neither a task nor a transport failure, and must not be dropped.
 			name: "a malformed stream is a protocol error",
 			apply: func(m *chatModel) {
-				m.appendEvent(a2atype.NewMessage(a2atype.MessageRoleAgent, a2atype.NewTextPart("first")))
-				m.appendEvent(a2atype.NewMessage(a2atype.MessageRoleAgent, a2atype.NewTextPart("second")))
+				streamEvent(m, a2atype.NewMessage(a2atype.MessageRoleAgent, a2atype.NewTextPart("first")))
+				streamEvent(m, a2atype.NewMessage(a2atype.MessageRoleAgent, a2atype.NewTextPart("second")))
 			},
-			want: "Protocol error",
+			want: "Protocol error", stillWorking: true,
 		},
 	}
 
@@ -172,7 +203,7 @@ func TestChatModelRendersStateClasses(t *testing.T) {
 			if tt.wantAbsent != "" {
 				assert.NotContains(t, shownText(model), tt.wantAbsent)
 			}
-			assert.False(t, model.working, "a settled task stops the working indicator")
+			assert.Equal(t, tt.stillWorking, model.working, "a settled task stops the working indicator")
 		})
 	}
 }
@@ -181,10 +212,10 @@ func TestChatModelRendersToolActivityBeforeLastChunk(t *testing.T) {
 	model := newTestChatModel()
 	model.Update(tea.WindowSizeMsg{Width: 80, Height: 20})
 
-	model.appendEvent(a2atype.NewArtifactEvent(reqCtx(), a2atype.NewTextPart("checking")))
-	model.appendEvent(a2atype.NewArtifactEvent(reqCtx(),
+	streamEvent(model, a2atype.NewArtifactEvent(reqCtx(), a2atype.NewTextPart("checking")))
+	streamEvent(model, a2atype.NewArtifactEvent(reqCtx(),
 		dataPart("function_call", "get_pods", map[string]any{"args": map[string]any{"namespace": "default"}})))
-	model.appendEvent(a2atype.NewArtifactEvent(reqCtx(),
+	streamEvent(model, a2atype.NewArtifactEvent(reqCtx(),
 		dataPart("function_response", "get_pods", map[string]any{"response": map[string]any{"pods": []any{"pod-a"}}})))
 
 	assert.Equal(t, []transcript.Entry{
@@ -203,9 +234,9 @@ func TestChatModelTextAfterToolActivityIsANewBlock(t *testing.T) {
 	model := newTestChatModel()
 
 	first := a2atype.NewArtifactEvent(reqCtx(), a2atype.NewTextPart("before"))
-	model.appendEvent(first)
-	model.appendEvent(a2atype.NewArtifactEvent(reqCtx(), dataPart("function_call", "get_pods", map[string]any{})))
-	model.appendEvent(a2atype.NewArtifactUpdateEvent(reqCtx(), first.Artifact.ID, a2atype.NewTextPart(" after")))
+	streamEvent(model, first)
+	streamEvent(model, a2atype.NewArtifactEvent(reqCtx(), dataPart("function_call", "get_pods", map[string]any{})))
+	streamEvent(model, a2atype.NewArtifactUpdateEvent(reqCtx(), first.Artifact.ID, a2atype.NewTextPart(" after")))
 
 	assert.Equal(t, []transcript.Entry{
 		transcript.AgentText{Text: "before"},
@@ -257,9 +288,9 @@ func TestChatModelRepeatedCallIDStartsANewEntry(t *testing.T) {
 
 	model.appendUser("again")
 	model.submit("again")
-	model.appendEvent(a2atype.NewArtifactEvent(reqCtx(), a2atype.NewTextPart("checking")))
-	model.appendEvent(a2atype.NewArtifactEvent(reqCtx(), dataPart("function_call", "get_pods", map[string]any{})))
-	model.appendEvent(a2atype.NewArtifactEvent(reqCtx(), dataPart("function_response", "get_pods", map[string]any{"response": "new"})))
+	streamEvent(model, a2atype.NewArtifactEvent(reqCtx(), a2atype.NewTextPart("checking")))
+	streamEvent(model, a2atype.NewArtifactEvent(reqCtx(), dataPart("function_call", "get_pods", map[string]any{})))
+	streamEvent(model, a2atype.NewArtifactEvent(reqCtx(), dataPart("function_response", "get_pods", map[string]any{"response": "new"})))
 
 	assert.Equal(t, []transcript.Entry{
 		old,
@@ -287,7 +318,7 @@ func TestChatModelEarlierRejectionDoesNotHideLaterNotRun(t *testing.T) {
 
 	model.appendUser("try again")
 	model.submit("try again")
-	model.appendEvent(a2atype.NewArtifactEvent(reqCtx(), dataPart("function_response", "delete_pod",
+	streamEvent(model, a2atype.NewArtifactEvent(reqCtx(), dataPart("function_response", "delete_pod",
 		map[string]any{"response": map[string]any{"error": `error tool "delete_pod" call is rejected`}})))
 
 	assert.Contains(t, shownText(model), "⊘ delete_pod")
@@ -336,8 +367,8 @@ func TestChatModelExpandedEntryStaysExpandedAsEntriesStreamIn(t *testing.T) {
 	model.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	require.Contains(t, model.vp.View(), "first-body")
 
-	model.appendEvent(a2atype.NewArtifactEvent(reqCtx(), a2atype.NewTextPart("more")))
-	model.appendEvent(a2atype.NewArtifactEvent(reqCtx(), dataPart("function_call", "two", map[string]any{})))
+	streamEvent(model, a2atype.NewArtifactEvent(reqCtx(), a2atype.NewTextPart("more")))
+	streamEvent(model, a2atype.NewArtifactEvent(reqCtx(), dataPart("function_call", "two", map[string]any{})))
 
 	assert.Contains(t, model.vp.View(), "first-body", "still expanded")
 	assert.True(t, model.folds.Expanded(1))
@@ -368,7 +399,228 @@ func TestChatModelSelectModeDoesNotJumpToNewestOnStream(t *testing.T) {
 	model.Update(tea.KeyMsg{Type: tea.KeyCtrlG})
 	selectKeys(model, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
 
-	model.appendEvent(a2atype.NewArtifactEvent(reqCtx(), a2atype.NewTextPart("streamed")))
+	streamEvent(model, a2atype.NewArtifactEvent(reqCtx(), a2atype.NewTextPart("streamed")))
 
 	assert.Contains(t, model.vp.View(), "message-0")
+}
+
+var esc = tea.KeyMsg{Type: tea.KeyEsc}
+
+// streamingChat returns a chat whose turn is running; withTask feeds an event naming task-1.
+func streamingChat(t *testing.T, withTask bool) (*chatModel, *fakeTurnClient) {
+	t.Helper()
+	client := &fakeTurnClient{}
+	m := newChatModel(context.Background(), "reporter", "ctx-1", client, false)
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 20})
+	m.submit("hi")
+	if withTask {
+		m.Update(clia2a.StreamResult{Event: a2atype.NewStatusUpdateEvent(reqCtx(), a2atype.TaskStateWorking, nil)})
+	}
+	require.True(t, m.isStreaming())
+	return m, client
+}
+
+// runCmd runs a command and every command it batches, returning their messages.
+// Callers must not pass a tea.Tick, which sleeps.
+func runCmd(cmd tea.Cmd) []tea.Msg {
+	if cmd == nil {
+		return nil
+	}
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		return []tea.Msg{msg}
+	}
+	var msgs []tea.Msg
+	for _, c := range batch {
+		msgs = append(msgs, runCmd(c)...)
+	}
+	return msgs
+}
+
+func armedAt(t *testing.T, m *chatModel) time.Time {
+	t.Helper()
+	turn, ok := m.turn.(*streamingTurn)
+	require.True(t, ok, "the turn is streaming")
+	return turn.cancelArmedAt
+}
+
+func TestChatModelSingleEscOnlyArmsCancel(t *testing.T) {
+	m, client := streamingChat(t, true)
+
+	_, cmd := m.Update(esc)
+
+	assert.NotNil(t, cmd, "arming schedules the disarm tick")
+	assert.Empty(t, client.cancels, "one esc does not cancel")
+	assert.False(t, armedAt(t, m).IsZero())
+	assert.Contains(t, m.View(), "press esc again to cancel")
+	assert.True(t, m.isStreaming())
+}
+
+func TestChatModelDoubleEscCancelsTheTask(t *testing.T) {
+	m, client := streamingChat(t, true)
+
+	m.Update(esc)
+	_, cmd := m.Update(esc)
+	msgs := runCmd(cmd)
+
+	require.Len(t, msgs, 1)
+	assert.NotEqual(t, tea.Quit(), msgs[0], "esc never quits")
+	assert.Equal(t, []a2atype.TaskID{"task-1"}, client.cancels)
+	assert.NotContains(t, m.View(), "press esc again to cancel")
+
+	m.Update(msgs[0])
+	assert.True(t, m.isStreaming(), "the stream stays open until the canceled status arrives")
+	assert.Contains(t, m.View(), "Canceling")
+
+	m.Update(esc)
+	_, cmd = m.Update(esc)
+	assert.Empty(t, runCmd(cmd), "a cancel in flight is not sent twice")
+	assert.Len(t, client.cancels, 1)
+
+	m.Update(clia2a.StreamResult{Event: a2atype.NewStatusUpdateEvent(reqCtx(), a2atype.TaskStateCanceled, nil)})
+	m.Update(streamDoneMsg{})
+	assert.False(t, m.isStreaming())
+	assert.Contains(t, shownText(m), "Task canceled.")
+}
+
+func TestChatModelCancelDisarms(t *testing.T) {
+	tests := []struct {
+		name   string
+		disarm func(m *chatModel)
+	}{
+		{"after the timeout", func(m *chatModel) { m.Update(cancelDisarmMsg{armedAt: armedAt(t, m)}) }},
+		{"on another key", func(m *chatModel) { m.Update(runes("a")) }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m, client := streamingChat(t, true)
+
+			m.Update(esc)
+			tt.disarm(m)
+
+			assert.True(t, armedAt(t, m).IsZero())
+			assert.NotContains(t, m.View(), "press esc again to cancel")
+			m.Update(esc) // arms again rather than cancelling
+			assert.Empty(t, client.cancels)
+		})
+	}
+}
+
+// A late tick from an earlier arm must not disarm a fresh one.
+func TestChatModelStaleDisarmKeepsTheNewArm(t *testing.T) {
+	m, _ := streamingChat(t, true)
+
+	m.Update(esc)
+	stale := armedAt(t, m)
+	m.Update(runes("a"))
+	m.Update(esc)
+	m.Update(cancelDisarmMsg{armedAt: stale.Add(-time.Second)})
+
+	assert.False(t, armedAt(t, m).IsZero())
+}
+
+func TestChatModelCancelBeforeTheFirstEventWaitsForATaskID(t *testing.T) {
+	m, client := streamingChat(t, false)
+
+	m.Update(esc)
+	_, cmd := m.Update(esc)
+	assert.Empty(t, runCmd(cmd))
+	assert.Empty(t, client.cancels, "no task id yet")
+
+	_, cmd = m.Update(clia2a.StreamResult{Event: a2atype.NewStatusUpdateEvent(reqCtx(), a2atype.TaskStateWorking, nil)})
+	runCmd(cmd)
+
+	assert.Equal(t, []a2atype.TaskID{"task-1"}, client.cancels, "the first event with a task id fires the cancel")
+}
+
+func TestChatModelCancelErrorIsABannerAndCanRetry(t *testing.T) {
+	m, client := streamingChat(t, true)
+	client.cancelErr = errors.New("task is not cancelable")
+
+	m.Update(esc)
+	_, cmd := m.Update(esc)
+	for _, msg := range runCmd(cmd) {
+		m.Update(msg)
+	}
+
+	assert.Contains(t, shownText(m), "task is not cancelable")
+	assert.True(t, m.isStreaming())
+
+	m.Update(esc)
+	_, cmd = m.Update(esc)
+	runCmd(cmd)
+	assert.Len(t, client.cancels, 2, "a failed cancel can be retried")
+}
+
+// In select mode esc means "back to the composer", even while a turn runs.
+func TestChatModelEscInSelectModeOnlyLeavesSelectMode(t *testing.T) {
+	m, client := streamingChat(t, true)
+	m.appendUser("pick me")
+	m.Update(tea.KeyMsg{Type: tea.KeyCtrlG})
+	require.Equal(t, modeSelect, m.mode)
+
+	m.Update(esc)
+
+	assert.Equal(t, modeCompose, m.mode)
+	assert.True(t, armedAt(t, m).IsZero(), "leaving select mode does not arm")
+	assert.Empty(t, client.cancels)
+}
+
+func TestChatModelEscWhileIdleDoesNothing(t *testing.T) {
+	m := newTestChatModel()
+
+	_, cmd := m.Update(esc)
+
+	assert.Nil(t, cmd)
+	assert.NotContains(t, m.View(), "press esc again to cancel")
+}
+
+// A message from a stream that already ended must not reopen or extend the turn.
+func TestChatModelIgnoresStreamResultsWhileIdle(t *testing.T) {
+	m := newTestChatModel()
+
+	m.Update(clia2a.StreamResult{Event: a2atype.NewArtifactEvent(reqCtx(), a2atype.NewTextPart("late"))})
+
+	assert.Empty(t, m.entries)
+}
+
+func lastBanner(t *testing.T, m *chatModel) transcript.Banner {
+	t.Helper()
+	for i := len(m.entries) - 1; i >= 0; i-- {
+		if banner, ok := m.entries[i].(transcript.Banner); ok {
+			return banner
+		}
+	}
+	require.Fail(t, "no banner shown")
+	return transcript.Banner{}
+}
+
+func TestChatModelStateBannersNameTheStatePlainly(t *testing.T) {
+	tests := []struct {
+		name  string
+		state a2atype.TaskState
+		kind  transcript.BannerKind
+		want  string
+	}{
+		{"canceled is information, since the user asked", a2atype.TaskStateCanceled, transcript.BannerInfo, "Task canceled."},
+		{"failed is an error", a2atype.TaskStateFailed, transcript.BannerError, "Task failed."},
+		{"rejected is an error", a2atype.TaskStateRejected, transcript.BannerError, "Task rejected."},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := newTestChatModel()
+			streamEvent(m, a2atype.NewStatusUpdateEvent(reqCtx(), tt.state, nil))
+
+			banner := lastBanner(t, m)
+			assert.Equal(t, tt.kind, banner.Kind)
+			assert.Contains(t, banner.Text, tt.want)
+			assert.NotContains(t, banner.Text, "TASK_STATE")
+		})
+	}
+}
+
+func TestStateLabel(t *testing.T) {
+	assert.Equal(t, "completed", stateLabel(a2atype.TaskStateCompleted))
+	assert.Equal(t, "input required", stateLabel(a2atype.TaskStateInputRequired))
 }

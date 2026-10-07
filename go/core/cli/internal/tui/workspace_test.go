@@ -504,7 +504,7 @@ func TestWorkspaceStopsTheOutgoingStreamOnSwitch(t *testing.T) {
 	loaded(m)
 	m.selectSession(first)
 	stopped := false
-	m.chat.cancel = func() { stopped = true }
+	m.chat.turn = &streamingTurn{stop: func() { stopped = true }}
 
 	m.selectSession(second)
 
@@ -520,19 +520,12 @@ func TestChatStreamsUnderTheWorkspaceContext(t *testing.T) {
 	loaded(m)
 	m.selectSession(ready)
 
-	streamCtx := make(chan context.Context, 1)
-	m.chat.send = func(ctx context.Context, _ *a2atype.SendMessageRequest) <-chan clia2a.StreamResult {
-		streamCtx <- ctx
-		return make(chan clia2a.StreamResult)
-	}
+	client := &fakeTurnClient{}
+	m.chat.client = client
 	m.chat.submit("hello")
 
-	var sent context.Context
-	select {
-	case sent = <-streamCtx:
-	default:
-		t.Fatal("the chat never started a stream")
-	}
+	sent := client.streamCtx
+	require.NotNil(t, sent, "the chat never started a stream")
 
 	cancel()
 	select {
@@ -549,6 +542,8 @@ func TestWorkspaceRoutesStreamMessagesRegardlessOfFocus(t *testing.T) {
 	m := testWorkspace(t, &fakeLister{pages: []*apiv1alpha1.ListSessionsResponse{page("", ready)}})
 	loaded(m)
 	m.selectSession(ready)
+	m.chat.client = &fakeTurnClient{}
+	m.chat.submit("hi")
 	m.focus = panelSessions
 
 	m.Update(clia2a.StreamResult{Err: errors.New("stream disconnected")})
@@ -684,6 +679,40 @@ func TestWorkspaceCtrlGWithoutEntriesStaysInComposer(t *testing.T) {
 	m.Update(tea.KeyMsg{Type: tea.KeyCtrlG})
 
 	assert.Equal(t, modeCompose, m.chat.mode)
+}
+
+// esc esc in the composer cancels through the workspace; the result reaches the chat wherever focus is.
+func TestWorkspaceDoubleEscCancelsTheRunningTurn(t *testing.T) {
+	m := openedChat(t)
+	client := &fakeTurnClient{cancelErr: errors.New("boom")}
+	m.chat.client = client
+	m.chat.submit("hi")
+	m.Update(clia2a.StreamResult{Event: a2atype.NewStatusUpdateEvent(reqCtx(), a2atype.TaskStateWorking, nil)})
+	assert.Contains(t, m.footerView(), "cancel: esc esc")
+
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	msgs := runCmd(cmd)
+	require.Len(t, msgs, 1)
+	assert.NotEqual(t, tea.Quit(), msgs[0])
+	assert.Equal(t, []a2atype.TaskID{"task-1"}, client.cancels)
+
+	m.focus = panelSessions
+	m.Update(msgs[0])
+	assert.Contains(t, shownText(m.chat), "boom", "a cancel failure is shown")
+}
+
+// Keys the workspace consumes still count as "another key" and disarm the cancel.
+func TestWorkspaceConsumedKeyDisarmsCancel(t *testing.T) {
+	m := openedChat(t)
+	m.chat.client = &fakeTurnClient{}
+	m.chat.submit("hi")
+
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	require.False(t, m.chat.turn.(*streamingTurn).cancelArmedAt.IsZero())
+	m.Update(tea.KeyMsg{Type: tea.KeyCtrlO})
+
+	assert.True(t, m.chat.turn.(*streamingTurn).cancelArmedAt.IsZero())
 }
 
 // With no chat open the empty pane tells the user to pick another panel, so digits must work.

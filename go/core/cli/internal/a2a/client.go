@@ -62,15 +62,8 @@ type StreamResult struct {
 }
 
 // StreamToChannel adapts a streaming A2A response to a channel for CLI and TUI consumption.
+// ctx should be the context the stream was opened with; cancelling it stops delivery.
 func StreamToChannel(
-	ctx context.Context,
-	client *a2aclient.Client,
-	req *a2atype.SendMessageRequest,
-) <-chan StreamResult {
-	return streamToChannel(ctx, client.SendStreamingMessage(ctx, req))
-}
-
-func streamToChannel(
 	ctx context.Context,
 	stream iter.Seq2[a2atype.Event, error],
 ) <-chan StreamResult {

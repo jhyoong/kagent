@@ -21,9 +21,6 @@ import (
 	"github.com/kagent-dev/kagent/go/core/cli/internal/tui/transcript"
 )
 
-// SendMessageFn abstracts the A2A client's SendStreamingMessage method for easier testing.
-type SendMessageFn func(ctx context.Context, req *a2atype.SendMessageRequest) <-chan clia2a.StreamResult
-
 type streamDoneMsg struct{}
 
 // chatMode says where keys go: the composer, or the transcript for folding entries.
@@ -60,11 +57,6 @@ type chatModel struct {
 	// selected is the visibleEntries() index under the cursor; meaningful only in modeSelect.
 	selected int
 
-	// projected is the assembler's last text projection, so cumulative chunks yield a delta not a duplicate.
-	assembler *clia2a.Assembler
-	projected string
-	lastState a2atype.TaskState
-
 	working    bool
 	workStart  time.Time
 	statusText string
@@ -72,14 +64,13 @@ type chatModel struct {
 	spin spinner.Model
 
 	// ctx is the workspace's context, so cancelling the program cancels an in-flight stream.
-	ctx       context.Context
-	send      SendMessageFn
-	streamCh  <-chan clia2a.StreamResult
-	cancel    context.CancelFunc
-	streaming bool
+	ctx    context.Context
+	client turnClient
+	// turn is never nil: idleTurn or *streamingTurn.
+	turn turnState
 }
 
-func newChatModel(ctx context.Context, agentRef string, contextID string, send SendMessageFn, verbose bool) *chatModel {
+func newChatModel(ctx context.Context, agentRef string, contextID string, client turnClient, verbose bool) *chatModel {
 	input := textarea.New()
 	input.Placeholder = "Type a message (Enter to send)"
 	input.FocusedStyle.CursorLine = lipgloss.NewStyle()
@@ -102,7 +93,8 @@ func newChatModel(ctx context.Context, agentRef string, contextID string, send S
 		verbose:   verbose,
 		vp:        vp,
 		input:     input,
-		send:      send,
+		client:    client,
+		turn:      idleTurn{},
 		spin:      sp,
 	}
 }
@@ -155,6 +147,9 @@ func (m *chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.KeyMsg:
+		if msg.Type != tea.KeyEsc {
+			m.disarmCancel()
+		}
 		if msg.String() == "ctrl+o" {
 			m.toggleAll()
 			return m, nil
@@ -168,10 +163,10 @@ func (m *chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.enterSelect()
 			return m, nil
 		case "esc":
-			// Never quits; the workspace owns ctrl+c.
-			return m, nil
+			// Never quits; the workspace owns ctrl+c. Twice in a row cancels the running turn.
+			return m, m.pressEsc()
 		case "enter":
-			if m.streaming {
+			if m.isStreaming() {
 				return m, nil
 			}
 			text := strings.TrimSpace(m.input.Value())
@@ -183,15 +178,26 @@ func (m *chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.submit(text)
 		}
 	case clia2a.StreamResult:
+		if !m.isStreaming() {
+			return m, nil // the stream this belonged to has ended
+		}
 		if msg.Err != nil {
 			m.appendTransportError(msg.Err)
 			m.endStream()
 			return m, nil
 		}
 		m.appendEvent(msg.Event)
-		return m, m.waitNext()
+		return m, tea.Batch(m.waitNext(), m.fireDeferredCancel())
 	case streamDoneMsg:
 		m.endStream()
+		return m, nil
+	case cancelDisarmMsg:
+		if turn, ok := m.turn.(*streamingTurn); ok && turn.cancelArmedAt.Equal(msg.armedAt) {
+			turn.cancelArmedAt = time.Time{}
+		}
+		return m, nil
+	case cancelResultMsg:
+		m.applyCancelResult(msg)
 		return m, nil
 	}
 
@@ -210,6 +216,14 @@ func (m *chatModel) View() string {
 	status := m.statusText
 	if m.working {
 		status = fmt.Sprintf("%s %s", m.spin.View(), status)
+	}
+	if turn, ok := m.turn.(*streamingTurn); ok {
+		switch {
+		case turn.cancel != cancelNone:
+			status += "  Canceling…"
+		case !turn.cancelArmedAt.IsZero():
+			status += "  press esc again to cancel"
+		}
 	}
 	rule := theme.SeparatorStyle().Render(strings.Repeat("─", max(10, width)))
 	if m.mode == modeSelect {
@@ -231,11 +245,20 @@ func (m *chatModel) setHeaderMeta(state string, lastActive time.Time) {
 }
 
 // stop cancels an in-flight stream, so a replaced chat stops delivering.
+// It drops the connection only; the task itself runs on (esc esc cancels it).
 func (m *chatModel) stop() {
-	if m != nil && m.cancel != nil {
-		m.cancel()
-		m.cancel = nil
+	if m == nil {
+		return
 	}
+	if turn, ok := m.turn.(*streamingTurn); ok && turn.stop != nil {
+		turn.stop()
+	}
+	m.turn = idleTurn{}
+}
+
+func (m *chatModel) isStreaming() bool {
+	_, ok := m.turn.(*streamingTurn)
+	return ok
 }
 
 // headerView pins who you are talking to; the ID is abbreviated so metadata survives a narrow pane.
@@ -254,28 +277,32 @@ func (m *chatModel) headerView(width int) string {
 }
 
 func (m *chatModel) submit(text string) tea.Cmd {
+	return m.startStream(a2atype.NewMessage(a2atype.MessageRoleUser, a2atype.NewTextPart(text)))
+}
+
+// startStream sends msg in this chat's session and makes it the running turn.
+// The caller shows msg in the transcript; this only seals the previous turn.
+func (m *chatModel) startStream(msg *a2atype.Message) tea.Cmd {
+	m.stop()
 	m.sealTurn()
-	m.streaming = true
-	m.assembler = &clia2a.Assembler{}
-	m.projected = ""
-	m.lastState = ""
 	m.setWorkingTime(time.Time{})
-	ctx, cancel := context.WithCancel(m.ctx)
-	m.cancel = cancel
-
-	msg := a2atype.NewMessage(a2atype.MessageRoleUser, a2atype.NewTextPart(text))
 	msg.ContextID = m.contextID
-	req := &a2atype.SendMessageRequest{Message: msg}
-
-	m.streamCh = m.send(ctx, req)
+	ctx, stop := context.WithCancel(m.ctx)
+	stream := m.client.SendStreamingMessage(ctx, &a2atype.SendMessageRequest{Message: msg})
+	m.turn = &streamingTurn{
+		ch:        clia2a.StreamToChannel(ctx, stream),
+		stop:      stop,
+		assembler: &clia2a.Assembler{},
+	}
 	return tea.Batch(m.waitNext(), m.tick())
 }
 
 func (m *chatModel) waitNext() tea.Cmd {
-	ch := m.streamCh
-	if ch == nil {
+	turn, ok := m.turn.(*streamingTurn)
+	if !ok {
 		return nil
 	}
+	ch := turn.ch
 	return func() tea.Msg {
 		result, ok := <-ch
 		if !ok {
@@ -287,28 +314,80 @@ func (m *chatModel) waitNext() tea.Cmd {
 
 // endStream commits any in-flight agent text and clears the working state.
 func (m *chatModel) endStream() {
+	m.stop()
 	m.textOpen = false
-	m.streaming = false
 	m.working = false
 	m.lastActive = time.Now()
 	m.updateStatus()
 }
 
-// appendEvent reduces one stream event and renders what it changed.
+// appendEvent reduces one event of the running turn and renders what it changed.
 func (m *chatModel) appendEvent(ev a2atype.Event) {
-	if ev == nil {
+	turn, ok := m.turn.(*streamingTurn)
+	if !ok || ev == nil {
 		return
 	}
-	if m.assembler == nil {
-		m.assembler = &clia2a.Assembler{}
-	}
-	if err := m.assembler.Apply(ev); err != nil {
+	if err := turn.assembler.Apply(ev); err != nil {
 		m.appendEntry(transcript.Banner{Kind: transcript.BannerError, Text: fmt.Sprintf("Protocol error: %v", err)})
 		return
 	}
 	m.renderToolActivity(eventParts(ev))
-	m.renderAssembledText()
-	m.renderState()
+	m.renderAssembledText(turn)
+	m.renderState(turn)
+}
+
+// pressEsc arms the cancel on the first esc of a running turn and cancels on the second.
+// A cancel already requested or in flight is not repeated.
+func (m *chatModel) pressEsc() tea.Cmd {
+	turn, ok := m.turn.(*streamingTurn)
+	if !ok || turn.cancel != cancelNone {
+		return nil
+	}
+	if !turn.cancelArmedAt.IsZero() && time.Since(turn.cancelArmedAt) <= cancelArmWindow {
+		turn.cancelArmedAt = time.Time{}
+		turn.cancel = cancelRequested
+		return m.fireDeferredCancel()
+	}
+	armedAt := time.Now()
+	turn.cancelArmedAt = armedAt
+	return tea.Tick(cancelArmWindow, func(time.Time) tea.Msg { return cancelDisarmMsg{armedAt: armedAt} })
+}
+
+// disarmCancel closes the double-tap window; any key but esc does.
+func (m *chatModel) disarmCancel() {
+	if turn, ok := m.turn.(*streamingTurn); ok {
+		turn.cancelArmedAt = time.Time{}
+	}
+}
+
+// fireDeferredCancel issues a requested cancel once the stream has named its task.
+func (m *chatModel) fireDeferredCancel() tea.Cmd {
+	turn, ok := m.turn.(*streamingTurn)
+	if !ok || turn.cancel != cancelRequested {
+		return nil
+	}
+	id := turn.taskID()
+	if id == "" {
+		return nil
+	}
+	turn.cancel = cancelInFlight
+	client, ctx, contextID := m.client, m.ctx, m.contextID
+	return func() tea.Msg {
+		_, err := client.CancelTask(ctx, &a2atype.CancelTaskRequest{ID: id})
+		return cancelResultMsg{contextID: contextID, err: err}
+	}
+}
+
+// applyCancelResult reports a failed cancel and lets esc esc retry it. Success needs nothing:
+// the turn stays "Canceling…" until the stream delivers the canceled status and ends.
+func (m *chatModel) applyCancelResult(msg cancelResultMsg) {
+	if msg.contextID != m.contextID || msg.err == nil {
+		return
+	}
+	if turn, ok := m.turn.(*streamingTurn); ok {
+		turn.cancel = cancelNone
+	}
+	m.appendEntry(transcript.Banner{Kind: transcript.BannerError, Text: fmt.Sprintf("Cancel failed: %v", msg.err)})
 }
 
 // eventParts returns what one event carries, so tool activity shows as it happens.
@@ -329,17 +408,17 @@ func eventParts(ev a2atype.Event) a2atype.ContentParts {
 }
 
 // renderAssembledText appends newly assembled text; the cumulative projection grows the block in place.
-func (m *chatModel) renderAssembledText() {
-	text, err := assembledText(m.assembler.Result())
+func (m *chatModel) renderAssembledText(turn *streamingTurn) {
+	text, err := assembledText(turn.assembler.Result())
 	if err != nil {
 		m.appendTransportError(err)
 		return
 	}
-	if text == m.projected {
+	if text == turn.projected {
 		return
 	}
-	delta, extends := strings.CutPrefix(text, m.projected)
-	m.projected = text
+	delta, extends := strings.CutPrefix(text, turn.projected)
+	turn.projected = text
 	if extends && m.textOpen {
 		last := len(m.entries) - 1
 		if open, ok := m.entries[last].(transcript.AgentText); ok {
@@ -382,16 +461,16 @@ func assembledText(result a2atype.SendMessageResult) (string, error) {
 }
 
 // renderState banners a state change; completion needs none.
-func (m *chatModel) renderState() {
-	task, ok := m.assembler.Result().(*a2atype.Task)
+func (m *chatModel) renderState(turn *streamingTurn) {
+	task, ok := turn.assembler.Result().(*a2atype.Task)
 	if !ok {
 		return
 	}
 	state := task.Status.State
-	if state == m.lastState {
+	if state == turn.lastState {
 		return
 	}
-	m.lastState = state
+	turn.lastState = state
 
 	switch state {
 	// The gateway rejects a message carrying a TaskID, so a reply starts a new task rather than resuming.
@@ -400,7 +479,13 @@ func (m *chatModel) renderState() {
 	case a2atype.TaskStateAuthRequired:
 		m.appendEntry(transcript.Banner{Kind: transcript.BannerInfo, Text: "⏸ Authentication required. This task cannot continue here."})
 	case a2atype.TaskStateFailed, a2atype.TaskStateRejected, a2atype.TaskStateCanceled:
-		banner := fmt.Sprintf("✗ Task %s.", state)
+		banner := fmt.Sprintf("Task %s.", stateLabel(state))
+		kind := transcript.BannerError
+		if state == a2atype.TaskStateCanceled {
+			kind = transcript.BannerInfo // the user asked for it
+		} else {
+			banner = "✗ " + banner
+		}
 		if task.Status.Message != nil {
 			detail, err := clia2a.PartsText(task.Status.Message.Parts)
 			if err != nil {
@@ -409,7 +494,7 @@ func (m *chatModel) renderState() {
 				banner += " " + detail
 			}
 		}
-		m.appendEntry(transcript.Banner{Kind: transcript.BannerError, Text: banner})
+		m.appendEntry(transcript.Banner{Kind: kind, Text: banner})
 	}
 	if state.Terminal() || state == a2atype.TaskStateInputRequired || state == a2atype.TaskStateAuthRequired {
 		m.working = false
@@ -417,6 +502,12 @@ func (m *chatModel) renderState() {
 	} else if task.Status.Timestamp != nil {
 		m.setWorkingTime(*task.Status.Timestamp)
 	}
+}
+
+// stateLabel is a task state in words: "canceled", "input required".
+func stateLabel(state a2atype.TaskState) string {
+	label := strings.TrimPrefix(string(state), "TASK_STATE_")
+	return strings.ToLower(strings.ReplaceAll(label, "_", " "))
 }
 
 // appendHistoryTask replays a past task as it happened, tool activity included.

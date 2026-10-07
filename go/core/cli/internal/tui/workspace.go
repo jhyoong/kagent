@@ -271,6 +271,10 @@ func (m *workspaceModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		// Any key but esc closes the chat's double-tap cancel window, including keys consumed here.
+		if m.chat != nil && msg.Type != tea.KeyEsc {
+			m.chat.disarmCancel()
+		}
 		if cmd, handled := m.handleKey(msg); handled {
 			return m, cmd
 		}
@@ -281,7 +285,7 @@ func (m *workspaceModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	// Stream and timer messages go to the chat wherever focus is, or a reply is stranded.
-	case clia2a.StreamResult, streamDoneMsg, spinner.TickMsg, tickMsg:
+	case clia2a.StreamResult, streamDoneMsg, spinner.TickMsg, tickMsg, cancelDisarmMsg, cancelResultMsg:
 		if m.chat == nil {
 			return m, nil
 		}
@@ -558,10 +562,7 @@ func (m *workspaceModel) selectSession(session *apiv1alpha1.Session) tea.Cmd {
 		return nil
 	}
 
-	send := func(ctx context.Context, req *a2atype.SendMessageRequest) <-chan clia2a.StreamResult {
-		return clia2a.StreamToChannel(ctx, a2aClient, req)
-	}
-	m.chat = newChatModel(m.ctx, session.GetAgent().GetName(), session.GetId(), send, m.verbose)
+	m.chat = newChatModel(m.ctx, session.GetAgent().GetName(), session.GetId(), a2aClient, m.verbose)
 	m.chat.setHeaderMeta(stateBadge(session.GetState()), session.GetUpdatedAt().AsTime())
 	// Bubble Tea calls Init only on the root model, so start the chat's here.
 	return tea.Batch(m.chat.Init(), m.resize(), m.loadHistory(session))
@@ -768,9 +769,11 @@ func (m *workspaceModel) hintsView() string {
 		return theme.DimStyle().Render(
 			"move: ↑↓ jk g G  fold: enter, space  fold all: o  composer: esc, i, ctrl+g")
 	}
-	hints := theme.DimStyle().Render(
-		"navigate: ↑↓  focus: click, tab or 0-4  search: /  enter: drill down, open  refresh: ctrl+r  details: ctrl+d  fold output: ctrl+o  select: ctrl+g  quit: ctrl+c")
-	return hints
+	hints := "navigate: ↑↓  focus: click, tab or 0-4  search: /  enter: drill down, open  refresh: ctrl+r  details: ctrl+d  fold output: ctrl+o  select: ctrl+g  quit: ctrl+c"
+	if m.focus == panelChat && m.chat != nil && m.chat.isStreaming() {
+		hints = "cancel: esc esc  " + hints
+	}
+	return theme.DimStyle().Render(hints)
 }
 
 // renderTitle returns the styled header line.

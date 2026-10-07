@@ -20,7 +20,7 @@ func TestStreamToChannelForwardsEventsAndTerminalError(t *testing.T) {
 		yield(nil, wantErr)
 	}
 
-	results := collectStreamResults(streamToChannel(t.Context(), iter.Seq2[a2atype.Event, error](stream)))
+	results := collectStreamResults(StreamToChannel(t.Context(), iter.Seq2[a2atype.Event, error](stream)))
 
 	require.Len(t, results, 2)
 	require.Same(t, wantEvent, results[0].Event)
@@ -36,7 +36,7 @@ func TestStreamToChannelForwardsContextCancellation(t *testing.T) {
 		yield(nil, ctx.Err())
 	}
 
-	results := collectStreamResults(streamToChannel(ctx, iter.Seq2[a2atype.Event, error](stream)))
+	results := collectStreamResults(StreamToChannel(ctx, iter.Seq2[a2atype.Event, error](stream)))
 
 	require.Len(t, results, 1)
 	require.ErrorIs(t, results[0].Err, context.Canceled)
