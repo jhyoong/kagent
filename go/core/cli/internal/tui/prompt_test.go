@@ -63,6 +63,8 @@ func press(m *chatModel, keys ...string) tea.Cmd {
 			msg = tea.KeyMsg{Type: tea.KeySpace, Runes: []rune(" ")}
 		case "ctrl+x":
 			msg = tea.KeyMsg{Type: tea.KeyCtrlX}
+		case "ctrl+p":
+			msg = tea.KeyMsg{Type: tea.KeyCtrlP}
 		default:
 			msg = runes(key)
 		}
@@ -226,12 +228,13 @@ func TestChatModelUnknownRequestOffersOnlyDiscard(t *testing.T) {
 			want:    `"Human input is required before the agent can continue."`,
 		},
 		{
-			name: "ask_user until the question form exists",
+			name: "nested ask_user, whose answer id is unsettled",
 			message: func() *a2atype.Message {
 				message := a2atype.NewMessage(a2atype.MessageRoleAgent, a2atype.NewTextPart("Which namespace?"))
 				require.NoError(t, kagenta2a.AttachHITL(message, kagenta2a.AskUserRequest{
 					Type: kagenta2a.HITLTypeAskUserRequest, ID: "ask-1",
 					Questions: []kagenta2a.HITLQuestion{{Question: "Which namespace?"}},
+					Nested:    &kagenta2a.NestedHITLRequest{SubagentName: "billing-agent", TaskID: "child", Tools: []kagenta2a.HITLTool{{ID: "child-ask", Name: "ask_user"}}},
 				}))
 				return message
 			}(),

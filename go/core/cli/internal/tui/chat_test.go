@@ -28,6 +28,14 @@ type fakeTurnClient struct {
 	cancelErr error
 	// cancelResult is the task CancelTask returns; nil means canceled.
 	cancelResult *a2atype.Task
+	gets         []a2atype.TaskID
+	getResult    *a2atype.Task
+	getErr       error
+}
+
+func (f *fakeTurnClient) GetTask(_ context.Context, req *a2atype.GetTaskRequest) (*a2atype.Task, error) {
+	f.gets = append(f.gets, req.ID)
+	return f.getResult, f.getErr
 }
 
 func (f *fakeTurnClient) SendStreamingMessage(ctx context.Context, req *a2atype.SendMessageRequest) iter.Seq2[a2atype.Event, error] {
@@ -639,6 +647,13 @@ func TestChatModelStateBannersNameTheStatePlainly(t *testing.T) {
 func TestStateLabel(t *testing.T) {
 	assert.Equal(t, "completed", stateLabel(a2atype.TaskStateCompleted))
 	assert.Equal(t, "input required", stateLabel(a2atype.TaskStateInputRequired))
+}
+
+func TestChatModelPausedStateIsNamedPlainlyAfterAFailedCheck(t *testing.T) {
+	m := newTestChatModel()
+	m.applyPauseCheck(pauseCheckedMsg{contextID: "ctx-1", task: &a2atype.Task{ID: "t", Status: a2atype.TaskStatus{State: a2atype.TaskStateCompleted}}})
+
+	assert.Equal(t, "The task is no longer waiting for input; it is completed.", lastBanner(t, m).Text)
 }
 
 // A cancel that fails after its stream was replaced must not touch the new turn.

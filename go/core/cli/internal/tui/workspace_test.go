@@ -769,6 +769,24 @@ func TestWorkspaceRoutesDiscardResultsRegardlessOfFocus(t *testing.T) {
 	assert.Contains(t, shownText(m.chat), "Discarded the request")
 }
 
+func TestWorkspaceRoutesPauseChecksRegardlessOfFocus(t *testing.T) {
+	m := openedChat(t)
+	client := &fakeTurnClient{getErr: errors.New("unavailable")}
+	m.chat.client = client
+	m.chat.submit("hi")
+	m.Update(streamMsg{gen: m.chat.streamGen, result: clia2a.StreamResult{Event: a2atype.NewStatusUpdateEvent(reqCtx(), a2atype.TaskStateInputRequired, questionStatus(t, "ask-1", regionQuestion))}})
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	_, cmd := m.Update(streamMsg{gen: m.chat.streamGen, result: clia2a.StreamResult{Err: errors.New("connection reset")}})
+	m.focus = panelSessions
+
+	for _, msg := range runCmd(cmd) {
+		m.Update(msg)
+	}
+
+	_, awaiting := m.chat.turn.(*awaitingTurn)
+	assert.True(t, awaiting, "the request is shown again")
+}
+
 // An early send would race the restored request, so the workspace holds sends until history arrives.
 func TestWorkspaceHoldsSendsUntilHistoryLoads(t *testing.T) {
 	m := openedChat(t)

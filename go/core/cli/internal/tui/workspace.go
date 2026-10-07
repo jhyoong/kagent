@@ -307,7 +307,7 @@ func (m *workspaceModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	// Stream and timer messages go to the chat wherever focus is, or a reply is stranded.
-	case streamMsg, streamDoneMsg, spinner.TickMsg, tickMsg, cancelDisarmMsg, cancelResultMsg, discardResultMsg:
+	case streamMsg, streamDoneMsg, spinner.TickMsg, tickMsg, cancelDisarmMsg, cancelResultMsg, discardResultMsg, pauseCheckedMsg:
 		if m.chat == nil {
 			return m, nil
 		}

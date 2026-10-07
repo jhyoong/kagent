@@ -199,8 +199,13 @@ func (m *chatModel) update(msg tea.Msg) tea.Cmd {
 			return nil // the stream this belonged to has ended or been replaced
 		}
 		if msg.result.Err != nil {
+			resumed := m.turn.(*streamingTurn).resumed
 			m.appendTransportError(msg.result.Err)
 			m.endStream()
+			if resumed != nil {
+				// The answer may not have arrived, so the request may still be waiting.
+				return m.checkPause(resumed)
+			}
 			return nil
 		}
 		m.appendEvent(msg.result.Event)
@@ -220,6 +225,9 @@ func (m *chatModel) update(msg tea.Msg) tea.Cmd {
 		return nil
 	case discardResultMsg:
 		m.applyDiscardResult(msg)
+		return nil
+	case pauseCheckedMsg:
+		m.applyPauseCheck(msg)
 		return nil
 	}
 
@@ -360,8 +368,9 @@ func (m *chatModel) resume(msg *a2atype.Message, paused *a2atype.Task) tea.Cmd {
 	return m.openStream(msg, &streamingTurn{
 		assembler: clia2a.ResumeAssembler(paused),
 		projected: projected,
-		// A replayed snapshot of the pause is not a new pause.
+		// A replayed snapshot of the pause is not a new pause; see renderState.
 		lastState: a2atype.TaskStateInputRequired,
+		resumed:   paused,
 	})
 }
 
@@ -561,7 +570,7 @@ func (m *chatModel) renderState(turn *streamingTurn) {
 		return
 	}
 	state := task.Status.State
-	if state == turn.lastState {
+	if state == turn.lastState && !turn.pausedAgain(task) {
 		return
 	}
 	turn.lastState = state
@@ -666,6 +675,39 @@ func (m *chatModel) awaitKey(turn *awaitingTurn, msg tea.KeyMsg) tea.Cmd {
 	}
 	m.appendEntry(record)
 	return m.resume(message, turn.paused)
+}
+
+// checkPause reads the task a failed resume answered, to learn whether its request still waits.
+func (m *chatModel) checkPause(paused *a2atype.Task) tea.Cmd {
+	client, ctx, contextID := m.client, m.ctx, m.contextID
+	return func() tea.Msg {
+		task, err := client.GetTask(ctx, &a2atype.GetTaskRequest{ID: paused.ID})
+		return pauseCheckedMsg{contextID: contextID, paused: paused, task: task, err: err}
+	}
+}
+
+// applyPauseCheck shows the request again when the task still waits, so it can
+// be answered or discarded. If the task cannot be read, the answered request is
+// shown: the server most likely still holds it, and if not, answering it again
+// fails visibly rather than leaving a request no one can reach.
+func (m *chatModel) applyPauseCheck(msg pauseCheckedMsg) {
+	if _, idle := m.turn.(idleTurn); msg.contextID != m.contextID || !idle {
+		return // the user has moved on; the session holds one task at a time
+	}
+	switch {
+	case msg.err != nil || msg.task == nil:
+		reason := "the server returned no task"
+		if msg.err != nil {
+			reason = msg.err.Error()
+		}
+		m.appendEntry(transcript.Banner{Kind: transcript.BannerError, Text: fmt.Sprintf("Could not check the task (%s); its request is shown again.", reason)})
+		m.await(msg.paused)
+	case msg.task.Status.State == a2atype.TaskStateInputRequired:
+		m.appendEntry(transcript.Banner{Kind: transcript.BannerInfo, Text: "The task is still waiting for input."})
+		m.await(msg.task)
+	default:
+		m.appendEntry(transcript.Banner{Kind: transcript.BannerInfo, Text: fmt.Sprintf("The task is no longer waiting for input; it is %s.", stateLabel(msg.task.Status.State))})
+	}
 }
 
 // discardRequest cancels the paused task, the only way to give up its request.

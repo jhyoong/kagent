@@ -1,7 +1,9 @@
 package tui
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"iter"
 	"time"
 
@@ -18,6 +20,7 @@ const cancelArmWindow = time.Second
 type turnClient interface {
 	SendStreamingMessage(ctx context.Context, req *a2atype.SendMessageRequest) iter.Seq2[a2atype.Event, error]
 	CancelTask(ctx context.Context, req *a2atype.CancelTaskRequest) (*a2atype.Task, error)
+	GetTask(ctx context.Context, req *a2atype.GetTaskRequest) (*a2atype.Task, error)
 }
 
 // turnState is the chat's current turn. Each state holds only what is meaningful in it,
@@ -38,6 +41,9 @@ type streamingTurn struct {
 	assembler *clia2a.Assembler
 	projected string
 	lastState a2atype.TaskState
+	// resumed is the paused task this stream answers; nil for a new message. A replay of
+	// its pause is not a new pause, and a failed stream must not strand its request.
+	resumed *a2atype.Task
 
 	// cancelArmedAt is set by the first esc; zero means disarmed.
 	cancelArmedAt time.Time
@@ -106,10 +112,43 @@ type cancelResultMsg struct {
 	err       error
 }
 
+// pauseCheckedMsg reports where a task stands after the stream answering it failed.
+type pauseCheckedMsg struct {
+	contextID string
+	// paused is the request the failed stream answered.
+	paused *a2atype.Task
+	task   *a2atype.Task
+	err    error
+}
+
 // discardResultMsg reports the CancelTask that discards a pending request, with the task it left.
 type discardResultMsg struct {
 	contextID string
 	taskID    a2atype.TaskID
 	task      *a2atype.Task
 	err       error
+}
+
+// pausedAgain reports whether task, seen by a resumed stream, holds a new request
+// rather than a replay of the one answered. The state alone cannot tell: both are
+// input-required, possibly with nothing in between.
+func (t *streamingTurn) pausedAgain(task *a2atype.Task) bool {
+	if t.resumed == nil || task.Status.State != a2atype.TaskStateInputRequired {
+		return false
+	}
+	return !samePause(task.Status.Message, t.resumed.Status.Message)
+}
+
+// samePause reports whether two status messages are the same request: by message
+// id when both have one, otherwise by content.
+func samePause(a, b *a2atype.Message) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if a.ID != "" && b.ID != "" {
+		return a.ID == b.ID
+	}
+	aJSON, aErr := json.Marshal(a)
+	bJSON, bErr := json.Marshal(b)
+	return aErr == nil && bErr == nil && bytes.Equal(aJSON, bJSON)
 }

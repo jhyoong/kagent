@@ -34,13 +34,8 @@ func newPrompt(agent string, pending hitl.Pending) prompt {
 			return newApprovalPrompt(agent, form)
 		}
 	case hitl.AskUser:
-		questions := make([]string, 0, len(req.Questions))
-		for _, question := range req.Questions {
-			questions = append(questions, question.Question)
-		}
-		return discardPrompt{
-			heading: "⏸ The agent is asking a question this view cannot answer yet.",
-			prose:   strings.Join(questions, " "),
+		if form, ok := hitl.NewAnswerForm(pending); ok {
+			return newQuestionPrompt(form)
 		}
 	case hitl.Unknown:
 		return discardPrompt{
@@ -233,4 +228,251 @@ func wrapLines(lines []string, width int) string {
 		wrapped = append(wrapped, line)
 	}
 	return strings.Join(wrapped, "\n")
+}
+
+// questionPrompt answers an ask-user request one question at a time, then
+// shows the answers for review when there are several.
+type questionPrompt struct {
+	form *hitl.AnswerForm
+	// cursor is the highlighted choice of the current question.
+	cursor int
+	// text edits the current question's answer when it is free text; nil otherwise.
+	text *textinput.Model
+}
+
+func newQuestionPrompt(form *hitl.AnswerForm) *questionPrompt {
+	p := &questionPrompt{form: form}
+	p.enter()
+	return p
+}
+
+func (p *questionPrompt) key(msg tea.KeyMsg) bool {
+	if p.form.Reviewing() {
+		switch msg.String() {
+		case "enter":
+			return p.form.Ready()
+		case "ctrl+p":
+			p.back()
+		}
+		return false
+	}
+	if p.text != nil {
+		switch msg.String() {
+		case "enter":
+			p.form.SetText(p.text.Value())
+			return p.advance()
+		case "ctrl+p", "esc":
+			p.back()
+		default:
+			updated, _ := p.text.Update(msg)
+			p.text = &updated
+		}
+		return false
+	}
+	current := p.form.Current()
+	choices := p.form.Questions()[current].Choices
+	switch msg.String() {
+	case "up":
+		p.cursor = max(p.cursor-1, 0)
+	case "down":
+		p.cursor = min(p.cursor+1, len(choices)-1)
+	case " ", "space":
+		if p.form.Kind(current) == hitl.AnyChoices {
+			p.form.Toggle(choices[p.cursor])
+		} else {
+			p.form.Choose(choices[p.cursor])
+		}
+	case "enter":
+		if p.form.Kind(current) == hitl.OneChoice {
+			p.form.Choose(choices[p.cursor])
+		}
+		return p.advance()
+	case "ctrl+p":
+		p.back()
+	}
+	return false
+}
+
+// advance sends answers that are ready, or moves past the answered question.
+func (p *questionPrompt) advance() bool {
+	if p.form.Ready() {
+		return true
+	}
+	if p.form.Next() {
+		p.enter()
+	}
+	return false
+}
+
+// back keeps the typed text and returns to the previous question or from review.
+func (p *questionPrompt) back() {
+	if p.text != nil {
+		p.form.SetText(p.text.Value())
+	}
+	if p.form.Prev() {
+		p.enter()
+	}
+}
+
+// enter prepares the current question: the cursor on its earlier choice, or its
+// earlier text in the field.
+func (p *questionPrompt) enter() {
+	p.cursor, p.text = 0, nil
+	if p.form.Reviewing() {
+		return
+	}
+	current := p.form.Current()
+	if p.form.Kind(current) != hitl.FreeText {
+		for i, choice := range p.form.Questions()[current].Choices {
+			if p.form.Selected(current, choice) {
+				p.cursor = i
+				break
+			}
+		}
+		return
+	}
+	input := textinput.New()
+	input.Prompt = "› "
+	input.Placeholder = "Your answer"
+	if earlier := p.form.Selections(current); len(earlier) > 0 {
+		input.SetValue(earlier[0])
+		input.CursorEnd()
+	}
+	input.Focus()
+	p.text = &input
+}
+
+func (p *questionPrompt) answer(contextID string) (*a2atype.Message, transcript.Entry, error) {
+	message, record, err := p.form.Answer(contextID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return message, record, nil
+}
+
+func (p *questionPrompt) view(width int) string {
+	if p.form.Reviewing() {
+		return p.reviewView(width)
+	}
+	questions := p.form.Questions()
+	current := p.form.Current()
+	question := questions[current]
+	label := ""
+	switch p.form.Kind(current) {
+	case hitl.OneChoice:
+		label = "choose one"
+	case hitl.AnyChoices:
+		label = "choose any"
+	}
+	labelled := func(text string) string {
+		if label == "" {
+			return text
+		}
+		return text + "   " + theme.DimStyle().Render(label)
+	}
+
+	var lines []string
+	const indent = "  "
+	if len(questions) == 1 {
+		// One question is the heading itself.
+		lines = append(lines, labelled(theme.PromptStyle().Render("? "+question.Question)))
+	} else {
+		lines = append(lines,
+			theme.PromptStyle().Render("? "+p.asker()+" asked you something")+"   "+theme.DimStyle().Render(fmt.Sprintf("(%d of %d)", current+1, len(questions))),
+			labelled(indent+question.Question))
+	}
+	lines = []string{wrapLines(lines, width)}
+
+	if p.text != nil {
+		p.text.Width = max(width-len(indent)-ansi.StringWidth(p.text.Prompt)-1, 1)
+		lines = append(lines, indent+p.text.View())
+		return strings.Join(lines, "\n")
+	}
+	for i, choice := range question.Choices {
+		cursor := indent + "  "
+		if i == p.cursor {
+			cursor = indent + theme.PromptStyle().Render(">") + " "
+		}
+		lines = append(lines, ansi.Truncate(cursor+p.choiceMark(current, choice)+" "+choice, width, "…"))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// reviewView lists every answer beside its question, numbered, before sending.
+func (p *questionPrompt) reviewView(width int) string {
+	questions := p.form.Questions()
+	// The question column is capped so a long question leaves room for its answer.
+	column := 0
+	for _, question := range questions {
+		column = max(column, ansi.StringWidth(question.Question))
+	}
+	column = min(column, max(width/2, 10))
+	lines := []string{theme.PromptStyle().Render("? Review answers")}
+	for i, question := range questions {
+		text := ansi.Truncate(question.Question, column, "…")
+		pad := strings.Repeat(" ", column-ansi.StringWidth(text)+3)
+		row := fmt.Sprintf("  %d %s%s%s", i+1, text, pad, strings.Join(p.form.Selections(i), ", "))
+		lines = append(lines, ansi.Truncate(row, width, "…"))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (p *questionPrompt) hints() string {
+	if p.form.Reviewing() {
+		return "enter send · ctrl+p edit · ctrl+x discard"
+	}
+	current := p.form.Current()
+	single := len(p.form.Questions()) == 1
+	var hints []string
+	switch p.form.Kind(current) {
+	case hitl.FreeText:
+		if single {
+			hints = append(hints, "enter send")
+		} else {
+			hints = append(hints, "enter next")
+		}
+		if current > 0 {
+			hints = append(hints, "esc back")
+		}
+	case hitl.OneChoice:
+		hints = append(hints, "↑↓ move")
+		if single {
+			hints = append(hints, "enter send")
+		} else {
+			hints = append(hints, "enter choose")
+		}
+	case hitl.AnyChoices:
+		hints = append(hints, "↑↓ move", "space toggle")
+		if single {
+			hints = append(hints, "enter send")
+		} else {
+			hints = append(hints, "enter next")
+		}
+	}
+	if current > 0 && p.form.Kind(current) != hitl.FreeText {
+		hints = append(hints, "ctrl+p previous")
+	}
+	return strings.Join(append(hints, "ctrl+x discard"), " · ")
+}
+
+// asker names who asked; a direct request is the agent's own.
+func (p *questionPrompt) asker() string {
+	if askedBy := p.form.Request().AskedBy; askedBy != "" {
+		return askedBy
+	}
+	return "The agent"
+}
+
+func (p *questionPrompt) choiceMark(question int, choice string) string {
+	selected := p.form.Selected(question, choice)
+	if p.form.Kind(question) == hitl.AnyChoices {
+		if selected {
+			return "[" + theme.ReadyStyle().Render("x") + "]"
+		}
+		return "[ ]"
+	}
+	if selected {
+		return "(" + theme.ReadyStyle().Render("•") + ")"
+	}
+	return "( )"
 }
