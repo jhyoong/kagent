@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"slices"
 	"strings"
 
@@ -29,8 +30,10 @@ import (
 
 // RunWorkspace launches a split-pane TUI: sessions (left), chat (center), details (toggleable right).
 func RunWorkspace(cfg *config.Config, clientSet *client.ClientSet, verbose bool) error {
+	out := newLockedOutput(os.Stdout)
 	m := newWorkspaceModel(cfg, clientSet, verbose)
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	m.clip = out
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithOutput(out))
 	_, err := p.Run()
 	return err
 }
@@ -53,8 +56,9 @@ type loadAgentMsg struct {
 }
 type sessionSelectedMsg struct{ session *api.Session }
 type sessionHistoryLoadedMsg struct {
-	items []*protocol.Task
-	err   error
+	sessionID string
+	items     []*protocol.Task
+	err       error
 }
 type agentChosenMsg struct{ agent api.AgentResponse }
 type createSessionMsg struct {
@@ -105,6 +109,11 @@ type workspaceModel struct {
 	agentList     list.Model
 	dlg           *dialogs.Manager
 
+	// selectLayout hides the sidebar and details so the transcript can be drag-selected alone.
+	selectLayout bool
+	// clip receives copied text; nil means copying is unavailable.
+	clip clipboardWriter
+
 	// key map
 	keys keys.KeyMap
 	help help.Model
@@ -116,6 +125,8 @@ func newWorkspaceModel(cfg *config.Config, clientSet *client.ClientSet, verbose 
 	sessionList.SetShowStatusBar(false)
 	sessionList.SetShowHelp(false)
 	sessionList.SetFilteringEnabled(true)
+	// q and esc would quit the whole TUI from the list; ctrl+c is the one quit key.
+	sessionList.DisableQuitKeybindings()
 
 	// Provide a sane default size before first WindowSizeMsg arrives
 	sessionList.SetSize(30, 20)
@@ -198,6 +209,7 @@ func (m *workspaceModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		m.help.Width = msg.Width
 		if m.choosingAgent {
 			m.agentList.SetSize(max(20, m.width/2), max(10, m.height/2))
 		}
@@ -282,25 +294,8 @@ func (m *workspaceModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.startChat(true)
 	case sessionHistoryLoadedMsg:
-		if m.chat != nil && len(msg.items) > 0 {
-			// Track message IDs we've already rendered to avoid duplicates across tasks/histories
-			seen := make(map[string]struct{}, 128)
-			// Render each task's history oldest-first
-			for _, task := range msg.items {
-				if task == nil || len(task.History) == 0 {
-					continue
-				}
-				for _, mmsg := range task.History {
-					if mmsg.MessageID != "" {
-						if _, ok := seen[mmsg.MessageID]; ok {
-							continue
-						}
-						seen[mmsg.MessageID] = struct{}{}
-					}
-					ev := protocol.StreamingMessageEvent{Result: &mmsg}
-					m.chat.appendEvent(ev)
-				}
-			}
+		if m.chat != nil && m.current != nil && msg.sessionID == m.current.ID {
+			m.chat.loadHistory(msg.items, msg.err)
 		}
 		return m, nil
 	case createSessionMsg:
@@ -360,15 +355,37 @@ func (m *workspaceModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		switch s {
 		case "tab":
+			if m.naming || m.selectLayout || m.agent == nil {
+				return m, nil
+			}
 			if m.focus == focusChat {
 				m.focus = focusSessions
 			} else {
 				m.focus = focusChat
 			}
+			if m.chat != nil {
+				m.chat.SetFocused(m.focus == focusChat)
+			}
 			return m, nil
 		case "ctrl+d":
 			m.showDetails = !m.showDetails
 			return m, m.resize()
+		case "ctrl+l":
+			if m.naming || m.chat == nil {
+				return m, nil
+			}
+			m.selectLayout = !m.selectLayout
+			if m.selectLayout {
+				m.focus = focusChat
+				m.chat.SetFocused(true)
+			}
+			return m, m.resize()
+		case "ctrl+o":
+			// Folding is global: it applies to the transcript whichever pane has focus.
+			if m.chat != nil {
+				m.chat.toggleAll()
+			}
+			return m, nil
 		case "enter":
 			if m.naming {
 				name := strings.TrimSpace(m.sessionInput.Value())
@@ -379,6 +396,8 @@ func (m *workspaceModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		}
+		// A key goes to one place: the naming modal, the session list, or the chat.
+		return m, m.routeKey(msg)
 	}
 
 	var cmds []tea.Cmd
@@ -404,21 +423,16 @@ func (m *workspaceModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(cmds...)
 	}
+	// Other messages (stream events, ticks, cursor blinks) reach every pane.
 	if m.focus == focusSessions {
 		var cmd tea.Cmd
 		m.sessions, cmd = m.sessions.Update(msg)
 		if cmd != nil {
 			cmds = append(cmds, cmd)
 		}
-		if km, ok := msg.(tea.KeyMsg); ok && km.String() == "enter" && !m.naming {
-			if it, ok := m.sessions.SelectedItem().(sessionListItem); ok {
-				return m, func() tea.Msg { return sessionSelectedMsg{session: it.s} }
-			}
-		}
 	}
 	if m.chat != nil {
-		mod, cmd := m.chat.Update(msg)
-		m.chat = mod.(*chatModel)
+		_, cmd := m.chat.Update(msg)
 		if cmd != nil {
 			cmds = append(cmds, cmd)
 		}
@@ -433,6 +447,32 @@ func (m *workspaceModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
+// routeKey sends a key to the one pane that owns it.
+func (m *workspaceModel) routeKey(msg tea.KeyMsg) tea.Cmd {
+	switch {
+	case m.naming:
+		var cmd tea.Cmd
+		m.sessionInput, cmd = m.sessionInput.Update(msg)
+		return cmd
+	case m.focus == focusSessions:
+		if msg.String() == "enter" && m.sessions.FilterState() != list.Filtering {
+			if it, ok := m.sessions.SelectedItem().(sessionListItem); ok {
+				return func() tea.Msg { return sessionSelectedMsg{session: it.s} }
+			}
+		}
+		var cmd tea.Cmd
+		m.sessions, cmd = m.sessions.Update(msg)
+		return cmd
+	case m.chat != nil:
+		if msg.String() == "ctrl+c" {
+			return tea.Quit // the chat's own quit would leave the workspace's state behind
+		}
+		_, cmd := m.chat.Update(msg)
+		return cmd
+	}
+	return nil
+}
+
 func (m *workspaceModel) resize() tea.Cmd {
 	if m.width == 0 || m.height == 0 {
 		return nil
@@ -442,14 +482,10 @@ func (m *workspaceModel) resize() tea.Cmd {
 	helpView := m.help.View(m.keys)
 	footerLines := lineCount(helpView)
 	availableHeight := max(m.height-headerLines-footerLines, 1)
-	sidebarWidth := 30
-	detailsWidth := 0
-	if m.showDetails {
-		detailsWidth = 32
-	}
+	sidebarWidth, detailsWidth := m.paneWidths()
 	centerWidth := max(m.width-sidebarWidth-detailsWidth, 20)
 
-	m.sessions.SetSize(sidebarWidth, availableHeight)
+	m.sessions.SetSize(30, availableHeight)
 	if m.chat != nil {
 		// send adjusted size to chat
 		_, cmd := m.chat.Update(tea.WindowSizeMsg{Width: centerWidth, Height: availableHeight})
@@ -477,12 +513,12 @@ func (m *workspaceModel) startChat(loadHistory bool) tea.Cmd {
 	sendFn := func(ctx context.Context, params protocol.SendMessageParams) (<-chan protocol.StreamingMessageEvent, error) {
 		return client.StreamMessage(ctx, params)
 	}
-	// Reset chat for new session
-	if m.chat == nil {
-		m.chat = newChatModel(m.agentRef, m.current.ID, sendFn, m.verbose)
-	} else {
-		*m.chat = *newChatModel(m.agentRef, m.current.ID, sendFn, m.verbose)
-	}
+	// Reset chat for new session; a stream of the previous one stops delivering.
+	m.chat.stopStream()
+	m.chat = newChatModel(m.agentRef, m.current.ID, sendFn, m.verbose)
+	m.chat.clip = m.clip
+	m.chat.historyPending = loadHistory
+	m.chat.SetFocused(m.focus == focusChat)
 	// Set header and clear transcript
 	title := theme.HeadingStyle().Render(fmt.Sprintf("Chat with %s (session %s)", m.agentRef, m.current.ID))
 	m.chat.ResetTranscript(title)
@@ -498,16 +534,19 @@ func (m *workspaceModel) fetchSessionHistoryCmd(sessionID string) tea.Cmd {
 		tasksURL := fmt.Sprintf("%s/api/sessions/%s/tasks?user_id=%s", m.cfg.KAgentURL, sessionID, "admin@kagent.dev")
 		resp, err := http.Get(tasksURL) //nolint:gosec
 		if err != nil {
-			return sessionHistoryLoadedMsg{items: nil, err: err}
+			return sessionHistoryLoadedMsg{sessionID: sessionID, err: err}
 		}
 		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return sessionHistoryLoadedMsg{sessionID: sessionID, err: fmt.Errorf("listing tasks: %s", resp.Status)}
+		}
 		var payload struct {
 			Data []*protocol.Task `json:"data"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-			return sessionHistoryLoadedMsg{items: nil, err: err}
+			return sessionHistoryLoadedMsg{sessionID: sessionID, err: err}
 		}
-		return sessionHistoryLoadedMsg{items: payload.Data, err: nil}
+		return sessionHistoryLoadedMsg{sessionID: sessionID, items: payload.Data}
 	}
 }
 
@@ -551,11 +590,7 @@ func (m *workspaceModel) renderDetails() {
 
 func (m *workspaceModel) View() string {
 	// layout: left sessions, center chat, right details (optional)
-	sidebarWidth := 30
-	detailsWidth := 0
-	if m.showDetails {
-		detailsWidth = 32
-	}
+	sidebarWidth, detailsWidth := m.paneWidths()
 
 	// If any dialog is active, render only the dialog overlay (full screen)
 	if v, ok := m.dlg.ViewOverlay(); ok {
@@ -564,7 +599,7 @@ func (m *workspaceModel) View() string {
 
 	// Left
 	var left string
-	if m.agent == nil {
+	if m.agent == nil || sidebarWidth == 0 {
 		// No agent select, no sessions sidebar
 		left = ""
 	} else {
@@ -576,7 +611,7 @@ func (m *workspaceModel) View() string {
 
 	// Center
 	// Use full width if left sidebar isn't rendered
-	hasLeft := m.agent != nil && len(m.sessions.Items()) > 0
+	hasLeft := left != ""
 	centerWidth := m.width - detailsWidth
 	if hasLeft {
 		centerWidth -= sidebarWidth
@@ -641,7 +676,7 @@ func (m *workspaceModel) View() string {
 
 	// Right (agent details)
 	right := ""
-	if m.agent != nil && m.showDetails {
+	if m.agent != nil && detailsWidth > 0 {
 		right = lipgloss.NewStyle().
 			Width(detailsWidth).
 			Border(lipgloss.RoundedBorder()).
@@ -699,6 +734,17 @@ func (m *workspaceModel) View() string {
 		return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, modal)
 	}
 	return content
+}
+
+// paneWidths are the sidebar's and details' widths; the select layout hides both.
+func (m *workspaceModel) paneWidths() (sidebar, details int) {
+	if m.selectLayout {
+		return 0, 0
+	}
+	if m.showDetails {
+		return 30, 32
+	}
+	return 30, 0
 }
 
 // renderTitle returns a styled block-art banner for the header.

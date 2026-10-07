@@ -29,7 +29,6 @@ require (
 	github.com/kagent-dev/kmcp v0.3.0
 	github.com/kagent-dev/mockllm v0.0.5
 	github.com/modelcontextprotocol/go-sdk v1.6.0
-	github.com/muesli/reflow v0.3.0
 	github.com/openai/openai-go/v3 v3.36.0
 	github.com/pgvector/pgvector-go v0.3.0
 	github.com/prometheus/client_golang v1.23.2
@@ -64,6 +63,8 @@ require (
 	github.com/agent-substrate/substrate v0.0.0
 	github.com/aws/aws-sdk-go-v2 v1.41.7
 	github.com/aws/aws-sdk-go-v2/service/bedrockruntime v1.50.6
+	github.com/charmbracelet/x/ansi v0.11.7
+	github.com/charmbracelet/x/term v0.2.2
 	github.com/google/go-containerregistry v0.21.5
 	github.com/google/jsonschema-go v0.4.3
 	github.com/jackc/pgx/v5 v5.9.2
@@ -157,9 +158,7 @@ require (
 	github.com/charithe/durationcheck v0.0.11 // indirect
 	github.com/charmbracelet/colorprofile v0.4.3 // indirect
 	github.com/charmbracelet/ultraviolet v0.0.0-20251205161215-1948445e3318 // indirect
-	github.com/charmbracelet/x/ansi v0.11.7 // indirect
 	github.com/charmbracelet/x/cellbuf v0.0.15 // indirect
-	github.com/charmbracelet/x/term v0.2.2 // indirect
 	github.com/charmbracelet/x/termios v0.1.1 // indirect
 	github.com/charmbracelet/x/windows v0.2.2 // indirect
 	github.com/ckaznocha/intrange v0.3.1 // indirect

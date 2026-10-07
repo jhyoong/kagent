@@ -9,6 +9,7 @@ var (
 
 	ColorError    = lipgloss.AdaptiveColor{Light: "#991B1B", Dark: "#7F1D1D"} // destructive
 	ColorSelected = lipgloss.AdaptiveColor{Light: "#7C3AED", Dark: "#6D28D9"} // primary/ring
+	ColorReady    = lipgloss.AdaptiveColor{Light: "#059669", Dark: "#10B981"} // emerald
 )
 
 func HeadingStyle() lipgloss.Style {
@@ -40,4 +41,14 @@ func ToolResultStyle() lipgloss.Style {
 
 func DimStyle() lipgloss.Style {
 	return lipgloss.NewStyle().Foreground(ColorMuted)
+}
+
+// PromptStyle marks a paused turn's prompt heading and cursor.
+func PromptStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(ColorPrimary).Bold(true)
+}
+
+// ReadyStyle marks an approval.
+func ReadyStyle() lipgloss.Style {
+	return lipgloss.NewStyle().Foreground(ColorReady)
 }
