@@ -588,6 +588,10 @@ func (m *workspaceModel) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 		m.focus = m.focus.next()
 		return m.resize(), true
 	case "0", "1", "2", "3", "4":
+		// In the composer a digit is text, not a shortcut.
+		if m.focus == panelChat && m.chat != nil {
+			return nil, false
+		}
 		m.focus = panelID(msg.String()[0] - '0')
 		return m.resize(), true
 	case "enter":

@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -233,7 +234,7 @@ func TestWorkspaceKeys(t *testing.T) {
 		wantReload bool
 	}{
 		{
-			name: "a digit focuses its panel", focus: panelChat,
+			name: "a digit focuses its panel", focus: panelSessions,
 			key:       tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("2")},
 			wantFocus: panelAgents,
 		},
@@ -567,4 +568,69 @@ func TestWorkspaceRefreshDropsADeletedSession(t *testing.T) {
 	assert.Nil(t, m.chat, "a deleted session leaves no chat behind")
 	assert.Nil(t, m.current)
 	assert.Contains(t, m.status, "no longer exists")
+}
+
+// openedChat returns a workspace whose chat has focus and a scrollable transcript.
+func openedChat(t *testing.T) *workspaceModel {
+	t.Helper()
+	ready := readySession("a", "smoke")
+	m := testWorkspace(t, &fakeLister{pages: []*apiv1alpha1.ListSessionsResponse{page("", ready)}})
+	loaded(m)
+	m.selectSession(ready)
+	m.focus = panelChat
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m.chat.vp.SetContent(strings.Repeat("line\n", 200))
+	m.chat.vp.GotoTop()
+	return m
+}
+
+// Typing must reach the composer: panel digits and viewport letters are not shortcuts there.
+func TestWorkspaceComposerKeepsTypedKeys(t *testing.T) {
+	for _, typed := range []string{"0", "1", "2", "3", "4", "k", "j", "b", "f", "u", "d", "h", "l", " ", "/"} {
+		t.Run(typed, func(t *testing.T) {
+			m := openedChat(t)
+			offset := m.chat.vp.YOffset
+
+			key := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(typed)}
+			if typed == " " {
+				key = tea.KeyMsg{Type: tea.KeySpace, Runes: []rune(typed)}
+			}
+			m.Update(key)
+
+			assert.Equal(t, typed, m.chat.input.Value())
+			assert.Equal(t, panelChat, m.focus)
+			assert.Equal(t, offset, m.chat.vp.YOffset)
+		})
+	}
+}
+
+func TestWorkspaceComposerEscDoesNotQuit(t *testing.T) {
+	m := openedChat(t)
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+	if cmd != nil {
+		assert.NotEqual(t, tea.Quit(), cmd(), "esc in the composer must not quit")
+	}
+	assert.Equal(t, panelChat, m.focus)
+}
+
+func TestWorkspaceComposerPageKeysStillScroll(t *testing.T) {
+	m := openedChat(t)
+
+	m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+
+	assert.Positive(t, m.chat.vp.YOffset)
+}
+
+// With no chat open the empty pane tells the user to pick another panel, so digits must work.
+func TestWorkspaceDigitsSwitchPanelsWithoutAChat(t *testing.T) {
+	m := testWorkspace(t, &fakeLister{pages: []*apiv1alpha1.ListSessionsResponse{page("")}})
+	loaded(m)
+	m.focus = panelChat
+	require.Nil(t, m.chat)
+
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("3")})
+
+	assert.Equal(t, panelID(3), m.focus)
 }

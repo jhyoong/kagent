@@ -104,12 +104,15 @@ func (m *chatModel) Init() tea.Cmd {
 }
 
 func (m *chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	// Always let viewport handle scrolling keys and mouse
 	var cmds []tea.Cmd
 	var cmd tea.Cmd
-	m.vp, cmd = m.vp.Update(msg)
-	if cmd != nil {
-		cmds = append(cmds, cmd)
+	// The viewport's default keymap binds letters and space, which are composer text;
+	// only page keys scroll it from the keyboard. Mouse and other messages pass through.
+	if key, isKey := msg.(tea.KeyMsg); !isKey || key.Type == tea.KeyPgUp || key.Type == tea.KeyPgDown {
+		m.vp, cmd = m.vp.Update(msg)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 	}
 
 	switch msg := msg.(type) {
@@ -145,11 +148,9 @@ func (m *chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "ctrl+c", "esc":
-			if m.cancel != nil {
-				m.cancel()
-			}
-			return m, tea.Quit
+		case "esc":
+			// Never quits; the workspace owns ctrl+c.
+			return m, nil
 		case "enter":
 			if m.streaming {
 				return m, nil
