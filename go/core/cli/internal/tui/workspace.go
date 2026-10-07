@@ -579,6 +579,11 @@ func (m *workspaceModel) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 		// Cancel the in-flight stream before teardown rather than letting process exit drop it.
 		m.chat.stop()
 		return tea.Quit, true
+	case "ctrl+o":
+		if m.chat != nil {
+			m.chat.toggleAll()
+		}
+		return nil, true
 	case "ctrl+r":
 		return m.loadSessions(), true
 	case "ctrl+d":
@@ -750,12 +755,22 @@ func (m *workspaceModel) centerView() string {
 
 // footerView is the keybinding hint bar, plus any current error.
 func (m *workspaceModel) footerView() string {
-	hints := theme.DimStyle().Render(
-		"navigate: ↑↓  focus: click, tab or 0-4  search: /  enter: drill down, open  refresh: ctrl+r  details: ctrl+d  quit: ctrl+c")
+	hints := m.hintsView()
 	if m.status == "" {
 		return hints
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, theme.ErrorStyle().Render(m.status), hints)
+}
+
+// hintsView changes with where keys go: transcript select mode, or the panels and composer.
+func (m *workspaceModel) hintsView() string {
+	if m.focus == panelChat && m.chat != nil && m.chat.mode == modeSelect {
+		return theme.DimStyle().Render(
+			"move: ↑↓ jk g G  fold: enter, space  fold all: o  composer: esc, i, ctrl+g")
+	}
+	hints := theme.DimStyle().Render(
+		"navigate: ↑↓  focus: click, tab or 0-4  search: /  enter: drill down, open  refresh: ctrl+r  details: ctrl+d  fold output: ctrl+o  select: ctrl+g  quit: ctrl+c")
+	return hints
 }
 
 // renderTitle returns the styled header line.

@@ -26,6 +26,14 @@ type SendMessageFn func(ctx context.Context, req *a2atype.SendMessageRequest) <-
 
 type streamDoneMsg struct{}
 
+// chatMode says where keys go: the composer, or the transcript for folding entries.
+type chatMode int
+
+const (
+	modeCompose chatMode = iota
+	modeSelect
+)
+
 type chatModel struct {
 	agentRef  string
 	contextID string
@@ -44,6 +52,13 @@ type chatModel struct {
 	// turnStart is where the current turn's entries begin. Call IDs repeat across turns, so
 	// tool activity pairs and Visible filters only within a turn; earlier entries are sealed.
 	turnStart int
+
+	// folds is indexed by position in visibleEntries(). Appending leaves earlier positions alone;
+	// positions shift only when Visible newly hides an earlier entry of the current turn.
+	folds transcript.Folds
+	mode  chatMode
+	// selected is the visibleEntries() index under the cursor; meaningful only in modeSelect.
+	selected int
 
 	// projected is the assembler's last text projection, so cumulative chunks yield a delta not a duplicate.
 	assembler *clia2a.Assembler
@@ -140,7 +155,18 @@ func (m *chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.KeyMsg:
+		if msg.String() == "ctrl+o" {
+			m.toggleAll()
+			return m, nil
+		}
+		if m.mode == modeSelect {
+			m.selectKey(msg)
+			return m, nil
+		}
 		switch msg.String() {
+		case "ctrl+g":
+			m.enterSelect()
+			return m, nil
 		case "esc":
 			// Never quits; the workspace owns ctrl+c.
 			return m, nil
@@ -186,6 +212,9 @@ func (m *chatModel) View() string {
 		status = fmt.Sprintf("%s %s", m.spin.View(), status)
 	}
 	rule := theme.SeparatorStyle().Render(strings.Repeat("─", max(10, width)))
+	if m.mode == modeSelect {
+		status = theme.DimStyle().Render("select mode")
+	}
 	return lipgloss.JoinVertical(lipgloss.Left,
 		m.headerView(width),
 		rule,
@@ -461,14 +490,82 @@ func (m *chatModel) visibleEntries() []transcript.Entry {
 }
 
 // render redraws the viewport at its width; entries wrap themselves.
+// In select mode the viewport follows the cursor instead of the newest entry.
 func (m *chatModel) render() {
 	visible := m.visibleEntries()
+	m.selected = min(m.selected, max(len(visible)-1, 0))
 	blocks := make([]string, 0, len(visible))
-	for _, entry := range visible {
-		blocks = append(blocks, transcript.Render(entry, m.vp.Width, false, false))
+	// start and end are the first and last viewport line of the selected block.
+	line, start, end := 0, 0, 0
+	for i, entry := range visible {
+		selected := m.mode == modeSelect && i == m.selected
+		block := transcript.Render(entry, m.vp.Width, m.folds.Expanded(i), selected)
+		blocks = append(blocks, block)
+		if selected {
+			start, end = line, line+lipgloss.Height(block)-1
+		}
+		line += lipgloss.Height(block) + 1 // the blank separator line
 	}
 	m.vp.SetContent(strings.Join(blocks, "\n\n"))
-	m.vp.GotoBottom()
+	if m.mode != modeSelect {
+		m.vp.GotoBottom()
+		return
+	}
+	switch {
+	case start < m.vp.YOffset:
+		m.vp.SetYOffset(start)
+	case end >= m.vp.YOffset+m.vp.Height:
+		// A block taller than the viewport shows its head.
+		m.vp.SetYOffset(min(end-m.vp.Height+1, start))
+	}
+}
+
+// toggleAll expands or collapses every entry's output.
+func (m *chatModel) toggleAll() {
+	m.folds.ToggleAll()
+	m.render()
+}
+
+// enterSelect starts at the newest entry; with nothing to select the composer keeps the keys.
+func (m *chatModel) enterSelect() {
+	n := len(m.visibleEntries())
+	if n == 0 {
+		return
+	}
+	m.mode = modeSelect
+	m.selected = n - 1
+	m.input.Blur()
+	m.render()
+}
+
+func (m *chatModel) leaveSelect() {
+	m.mode = modeCompose
+	m.input.Focus()
+	m.render()
+}
+
+// selectKey moves over every visible entry (not only foldable ones, so the reader can
+// read and later copy any block); toggling is meaningful for tool activity.
+func (m *chatModel) selectKey(msg tea.KeyMsg) {
+	last := len(m.visibleEntries()) - 1
+	switch msg.String() {
+	case "up", "k":
+		m.selected = max(m.selected-1, 0)
+	case "down", "j":
+		m.selected = min(m.selected+1, last)
+	case "g":
+		m.selected = 0
+	case "G":
+		m.selected = last
+	case "enter", " ", "space":
+		m.folds.Toggle(m.selected)
+	case "o":
+		m.folds.ToggleAll()
+	case "esc", "ctrl+g", "i":
+		m.leaveSelect()
+		return
+	}
+	m.render()
 }
 
 type tickMsg time.Time

@@ -12,6 +12,7 @@ import (
 	apiv1alpha1 "github.com/kagent-dev/kagent/go/api/gen/kagent/api/v1alpha1"
 	clia2a "github.com/kagent-dev/kagent/go/core/cli/internal/a2a"
 	"github.com/kagent-dev/kagent/go/core/cli/internal/connection"
+	"github.com/kagent-dev/kagent/go/core/cli/internal/tui/transcript"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -623,6 +624,68 @@ func TestWorkspaceComposerPageKeysStillScroll(t *testing.T) {
 	assert.Positive(t, m.chat.vp.YOffset)
 }
 
+func toolEntry(id string) transcript.ToolActivity {
+	return transcript.ToolActivity{
+		ID: id, Name: "get_logs", Args: map[string]any{"pod": "checkout"},
+		Outcome: transcript.Returned{Response: map[string]any{"result": "panic: missing env"}},
+	}
+}
+
+func runes(s string) tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)} }
+
+func TestWorkspaceCtrlOTogglesAllToolOutput(t *testing.T) {
+	m := openedChat(t)
+	m.chat.appendEntry(toolEntry("a"))
+
+	assert.NotContains(t, m.chat.vp.View(), "panic: missing env")
+
+	m.Update(tea.KeyMsg{Type: tea.KeyCtrlO})
+	assert.Contains(t, m.chat.vp.View(), "▾ ✓ get_logs")
+	assert.Contains(t, m.chat.vp.View(), "panic: missing env")
+
+	m.Update(tea.KeyMsg{Type: tea.KeyCtrlO})
+	assert.Contains(t, m.chat.vp.View(), "▸ ✓ get_logs")
+	assert.NotContains(t, m.chat.vp.View(), "panic: missing env")
+}
+
+func TestWorkspaceSelectModeFoldsOneEntryAndReturnsToComposer(t *testing.T) {
+	m := openedChat(t)
+	m.chat.appendEntry(toolEntry("a"))
+	m.chat.appendEntry(toolEntry("b"))
+
+	m.Update(tea.KeyMsg{Type: tea.KeyCtrlG})
+	require.Equal(t, modeSelect, m.chat.mode)
+	assert.Equal(t, 1, m.chat.selected, "starts on the newest entry")
+	assert.Contains(t, m.footerView(), "fold: enter, space")
+
+	m.Update(runes("k"))
+	assert.Equal(t, 0, m.chat.selected)
+	assert.Empty(t, m.chat.input.Value(), "select-mode keys are not typed")
+
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	assert.True(t, m.chat.folds.Expanded(0))
+	assert.False(t, m.chat.folds.Expanded(1))
+	assert.Equal(t, 1, strings.Count(m.chat.vp.View(), "panic: missing env"))
+
+	m.Update(runes("o"))
+	assert.Equal(t, 2, strings.Count(m.chat.vp.View(), "panic: missing env"), "o flips the default over the single toggle")
+
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	assert.Equal(t, modeCompose, m.chat.mode)
+	assert.NotContains(t, m.footerView(), "fold: enter, space")
+
+	m.Update(runes("j"))
+	assert.Equal(t, "j", m.chat.input.Value(), "typing works again")
+}
+
+func TestWorkspaceCtrlGWithoutEntriesStaysInComposer(t *testing.T) {
+	m := openedChat(t)
+
+	m.Update(tea.KeyMsg{Type: tea.KeyCtrlG})
+
+	assert.Equal(t, modeCompose, m.chat.mode)
+}
+
 // With no chat open the empty pane tells the user to pick another panel, so digits must work.
 func TestWorkspaceDigitsSwitchPanelsWithoutAChat(t *testing.T) {
 	m := testWorkspace(t, &fakeLister{pages: []*apiv1alpha1.ListSessionsResponse{page("")}})
@@ -630,7 +693,7 @@ func TestWorkspaceDigitsSwitchPanelsWithoutAChat(t *testing.T) {
 	m.focus = panelChat
 	require.Nil(t, m.chat)
 
-	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("3")})
+	m.Update(runes("3"))
 
 	assert.Equal(t, panelID(3), m.focus)
 }

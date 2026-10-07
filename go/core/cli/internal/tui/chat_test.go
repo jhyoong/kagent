@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -290,4 +291,84 @@ func TestChatModelEarlierRejectionDoesNotHideLaterNotRun(t *testing.T) {
 		map[string]any{"response": map[string]any{"error": `error tool "delete_pod" call is rejected`}})))
 
 	assert.Contains(t, shownText(model), "⊘ delete_pod")
+}
+
+func selectKeys(m *chatModel, keys ...tea.KeyMsg) {
+	for _, k := range keys {
+		m.Update(k)
+	}
+}
+
+func TestChatModelSelectCursorMoves(t *testing.T) {
+	model := newTestChatModel()
+	model.Update(tea.WindowSizeMsg{Width: 80, Height: 20})
+	for _, text := range []string{"a", "b", "c"} {
+		model.appendUser(text)
+	}
+	model.Update(tea.KeyMsg{Type: tea.KeyCtrlG})
+
+	tests := []struct {
+		key  tea.KeyMsg
+		want int
+	}{
+		{tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")}, 0},
+		{tea.KeyMsg{Type: tea.KeyUp}, 0},
+		{tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")}, 1},
+		{tea.KeyMsg{Type: tea.KeyDown}, 2},
+		{tea.KeyMsg{Type: tea.KeyDown}, 2},
+		{tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")}, 1},
+		{tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("G")}, 2},
+	}
+	for _, tt := range tests {
+		model.Update(tt.key)
+		assert.Equal(t, tt.want, model.selected, tt.key.String())
+	}
+}
+
+// Fold indices are positions in the visible transcript, so growth does not disturb them.
+func TestChatModelExpandedEntryStaysExpandedAsEntriesStreamIn(t *testing.T) {
+	model := newTestChatModel()
+	model.Update(tea.WindowSizeMsg{Width: 80, Height: 40})
+	model.appendUser("hi")
+	model.appendEntry(transcript.ToolActivity{ID: "a", Name: "one", Outcome: transcript.Returned{Response: map[string]any{"result": "first-body"}}})
+	model.Update(tea.KeyMsg{Type: tea.KeyCtrlG})
+	model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	require.Contains(t, model.vp.View(), "first-body")
+
+	model.appendEvent(a2atype.NewArtifactEvent(reqCtx(), a2atype.NewTextPart("more")))
+	model.appendEvent(a2atype.NewArtifactEvent(reqCtx(), dataPart("function_call", "two", map[string]any{})))
+
+	assert.Contains(t, model.vp.View(), "first-body", "still expanded")
+	assert.True(t, model.folds.Expanded(1))
+	assert.False(t, model.folds.Expanded(3), "the new entry follows the default")
+}
+
+func TestChatModelSelectedEntryScrollsIntoView(t *testing.T) {
+	model := newTestChatModel()
+	model.Update(tea.WindowSizeMsg{Width: 40, Height: 8}) // 5-line viewport
+	for i := range 10 {
+		model.appendUser(fmt.Sprintf("message-%d", i))
+	}
+	model.Update(tea.KeyMsg{Type: tea.KeyCtrlG})
+	selectKeys(model, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
+	assert.Contains(t, model.vp.View(), "message-0", "g scrolls to the top")
+
+	selectKeys(model, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("G")})
+	assert.Contains(t, model.vp.View(), "message-9")
+	assert.NotContains(t, model.vp.View(), "message-0")
+}
+
+func TestChatModelSelectModeDoesNotJumpToNewestOnStream(t *testing.T) {
+	model := newTestChatModel()
+	model.Update(tea.WindowSizeMsg{Width: 40, Height: 8})
+	for i := range 10 {
+		model.appendUser(fmt.Sprintf("message-%d", i))
+	}
+	model.Update(tea.KeyMsg{Type: tea.KeyCtrlG})
+	selectKeys(model, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
+
+	model.appendEvent(a2atype.NewArtifactEvent(reqCtx(), a2atype.NewTextPart("streamed")))
+
+	assert.Contains(t, model.vp.View(), "message-0")
 }
