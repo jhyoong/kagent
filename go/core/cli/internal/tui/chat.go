@@ -63,6 +63,14 @@ type chatModel struct {
 	working    bool
 	workStart  time.Time
 	statusText string
+	// note is a one-off status such as "copied 12 bytes"; the next key clears it.
+	note string
+
+	// clip receives copied text; nil means copying is unavailable.
+	clip clipboardWriter
+	// compact drops the chat's own header and rules: the select layout shows the
+	// workspace header instead and the transcript must start at the first column.
+	compact bool
 
 	spin spinner.Model
 
@@ -160,16 +168,21 @@ func (m *chatModel) update(msg tea.Msg) tea.Cmd {
 		if msg.Type != tea.KeyEsc {
 			m.disarmCancel()
 		}
+		m.note = ""
 		if msg.String() == "ctrl+o" {
 			m.toggleAll()
 			return nil
 		}
 		if m.mode == modeSelect {
-			m.selectKey(msg)
-			return nil
+			return m.selectKey(msg)
 		}
 		if msg.String() == "ctrl+g" {
 			m.enterSelect()
+			return nil
+		}
+		// Copying the last answer is harmless while a prompt replaces the composer, so it is not gated.
+		if msg.String() == "ctrl+y" {
+			m.copyLastAnswer()
 			return nil
 		}
 		if turn, ok := m.turn.(*awaitingTurn); ok {
@@ -184,6 +197,7 @@ func (m *chatModel) update(msg tea.Msg) tea.Cmd {
 				return nil
 			}
 			if m.historyPending {
+				m.note = "loading history…"
 				return nil
 			}
 			text := strings.TrimSpace(m.input.Value())
@@ -229,6 +243,8 @@ func (m *chatModel) update(msg tea.Msg) tea.Cmd {
 	case pauseCheckedMsg:
 		m.applyPauseCheck(msg)
 		return nil
+	case exportDoneMsg:
+		return m.applyExportDone(msg)
 	}
 
 	if _, awaiting := m.turn.(*awaitingTurn); !awaiting {
@@ -261,14 +277,22 @@ func (m *chatModel) View() string {
 	if m.mode == modeSelect {
 		status = theme.DimStyle().Render("select mode")
 	}
-	return lipgloss.JoinVertical(lipgloss.Left,
-		m.headerView(width),
-		rule,
-		m.vp.View(),
-		rule,
-		theme.StatusStyle().Render(status),
-		m.bottomView(width),
-	)
+	if m.note != "" {
+		status = m.note
+	}
+	parts := []string{m.vp.View(), rule, theme.StatusStyle().Render(status), m.bottomView(width)}
+	if !m.compact {
+		parts = append([]string{m.headerView(width), rule}, parts...)
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+}
+
+// topHeight is the lines topView takes.
+func (m *chatModel) topHeight(width int) int {
+	if m.compact {
+		return 0
+	}
+	return lipgloss.Height(m.headerView(width)) + 1
 }
 
 // bottomView is the composer, or the prompt of a paused turn with its hint line.
@@ -294,8 +318,8 @@ func (m *chatModel) layout() {
 		return
 	}
 	width := m.vp.Width
-	// Two rules and the status line sit between the header and the bottom block.
-	chrome := lipgloss.Height(m.headerView(width)) + 3 + lipgloss.Height(m.bottomView(width))
+	// The rule and status line sit between the transcript and the bottom block.
+	chrome := m.topHeight(width) + 2 + lipgloss.Height(m.bottomView(width))
 	if height := max(m.height-chrome, 5); height != m.vp.Height {
 		m.vp.Height = height
 		m.render()
@@ -913,7 +937,7 @@ func (m *chatModel) leaveSelect() {
 
 // selectKey moves over every visible entry (not only foldable ones, so the reader can
 // read and later copy any block); toggling is meaningful for tool activity.
-func (m *chatModel) selectKey(msg tea.KeyMsg) {
+func (m *chatModel) selectKey(msg tea.KeyMsg) tea.Cmd {
 	last := len(m.visibleEntries()) - 1
 	switch msg.String() {
 	case "up", "k":
@@ -928,11 +952,18 @@ func (m *chatModel) selectKey(msg tea.KeyMsg) {
 		m.folds.Toggle(m.selected)
 	case "o":
 		m.folds.ToggleAll()
+	case "y":
+		m.copySelected()
+	case "Y":
+		m.copyTranscript()
+	case "e":
+		return m.exportTranscript()
 	case "esc", "ctrl+g", "i":
 		m.leaveSelect()
-		return
+		return nil
 	}
 	m.render()
+	return nil
 }
 
 type tickMsg time.Time

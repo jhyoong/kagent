@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"strings"
 
@@ -55,7 +56,10 @@ func RunWorkspace(ctx context.Context, cfg Options, api *client.APIClientSet, ga
 	kubeCatalog, catalogErr := newKubeCatalog()
 	m := newWorkspaceModel(ctx, cfg, api, gateway, kubeCatalog, catalogErr, verbose)
 	// Mouse reporting costs click-drag selection, which shift (option on macOS) restores.
-	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	// Frames and OSC 52 clipboard writes share one locked writer so they cannot interleave.
+	out := newLockedOutput(os.Stdout)
+	m.clip = out
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion(), tea.WithOutput(out))
 	_, err := p.Run()
 	return err
 }
@@ -121,6 +125,13 @@ type workspaceModel struct {
 	agent     string
 
 	focus panelID
+
+	// clip receives copied text; chats opened later inherit it.
+	clip clipboardWriter
+	// selectLayout shows only the transcript, borderless and with the mouse released, so the
+	// terminal's own selection copies clean text. returnFocus is restored when it ends.
+	selectLayout bool
+	returnFocus  panelID
 }
 
 // newWorkspaceModel builds the model from resolved dependencies; it reads no configuration of its own.
@@ -307,7 +318,7 @@ func (m *workspaceModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	// Stream and timer messages go to the chat wherever focus is, or a reply is stranded.
-	case streamMsg, streamDoneMsg, spinner.TickMsg, tickMsg, cancelDisarmMsg, cancelResultMsg, discardResultMsg, pauseCheckedMsg:
+	case streamMsg, streamDoneMsg, spinner.TickMsg, tickMsg, cancelDisarmMsg, cancelResultMsg, discardResultMsg, pauseCheckedMsg, exportDoneMsg:
 		if m.chat == nil {
 			return m, nil
 		}
@@ -321,6 +332,9 @@ func (m *workspaceModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // handleMouse focuses the clicked panel and selects the clicked row.
 func (m *workspaceModel) handleMouse(msg tea.MouseMsg) (tea.Cmd, bool) {
+	if m.selectLayout {
+		return nil, true // capture is released, so this is only a stray event
+	}
 	if msg.Action != tea.MouseActionRelease || msg.Button != tea.MouseButtonLeft {
 		return nil, false
 	}
@@ -585,6 +599,8 @@ func (m *workspaceModel) selectSession(session *apiv1alpha1.Session) tea.Cmd {
 	}
 
 	m.chat = newChatModel(m.ctx, session.GetAgent().GetName(), session.GetId(), a2aClient, m.verbose)
+	m.chat.clip = m.clip
+	m.chat.compact = m.selectLayout
 	m.chat.historyPending = true
 	m.chat.setHeaderMeta(stateBadge(session.GetState()), session.GetUpdatedAt().AsTime())
 	// Bubble Tea calls Init only on the root model, so start the chat's here.
@@ -603,6 +619,8 @@ func (m *workspaceModel) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 		// Cancel the in-flight stream before teardown rather than letting process exit drop it.
 		m.chat.stop()
 		return tea.Quit, true
+	case "ctrl+l":
+		return m.toggleSelectLayout(), true
 	case "ctrl+o":
 		if m.chat != nil {
 			m.chat.toggleAll()
@@ -611,9 +629,15 @@ func (m *workspaceModel) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 	case "ctrl+r":
 		return m.loadSessions(), true
 	case "ctrl+d":
+		if m.selectLayout {
+			return nil, true
+		}
 		m.showDetails = !m.showDetails
 		return m.resize(), true
 	case "tab":
+		if m.selectLayout {
+			return nil, true // the only visible panel is the chat
+		}
 		m.focus = m.focus.next()
 		return m.resize(), true
 	case "0", "1", "2", "3", "4":
@@ -627,6 +651,34 @@ func (m *workspaceModel) handleKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 		return m.activateFocused()
 	}
 	return nil, false
+}
+
+// toggleSelectLayout hides or restores the sidebar, details and borders, and releases or
+// recaptures the mouse; the returned command is Bubble Tea's mouse mode switch.
+func (m *workspaceModel) toggleSelectLayout() tea.Cmd {
+	m.selectLayout = !m.selectLayout
+	if m.chat != nil {
+		m.chat.compact = m.selectLayout
+	}
+	var mouse tea.Cmd
+	if m.selectLayout {
+		m.returnFocus, m.focus = m.focus, panelChat
+		mouse = tea.DisableMouse
+	} else {
+		m.focus = m.returnFocus
+		mouse = tea.EnableMouseCellMotion
+	}
+	return tea.Batch(mouse, m.resize())
+}
+
+// selectLayoutHeader replaces the title line in select layout.
+func (m *workspaceModel) selectLayoutHeader() string {
+	parts := []string{"kagent"}
+	if m.chat != nil {
+		parts = append(parts, m.chat.agentRef, sessionview.ShortID(m.chat.contextID))
+	}
+	parts = append(parts, "select layout (mouse released)", "ctrl+l to return")
+	return theme.DimStyle().Render(strings.Join(parts, " · "))
 }
 
 // activateFocused narrows the cascade, or opens a chat from the session panel.
@@ -694,10 +746,11 @@ func (m *workspaceModel) resize() tea.Cmd {
 	}
 
 	if m.chat != nil {
-		_, cmd := m.chat.Update(tea.WindowSizeMsg{
-			Width:  panelInnerWidth(m.centerWidth()),
-			Height: panelInnerHeight(available),
-		})
+		size := tea.WindowSizeMsg{Width: panelInnerWidth(m.centerWidth()), Height: panelInnerHeight(available)}
+		if m.selectLayout {
+			size = tea.WindowSizeMsg{Width: m.width, Height: available}
+		}
+		_, cmd := m.chat.Update(size)
 		return cmd
 	}
 	return nil
@@ -714,6 +767,9 @@ func (m *workspaceModel) bodyHeight() int {
 }
 
 func (m *workspaceModel) centerWidth() int {
+	if m.selectLayout {
+		return m.width
+	}
 	width := m.width - sidebarWidth
 	if m.showDetails {
 		width -= detailsWidth
@@ -739,6 +795,9 @@ func (m *workspaceModel) renderDetails() {
 }
 
 func (m *workspaceModel) View() string {
+	if m.selectLayout {
+		return lipgloss.JoinVertical(lipgloss.Left, m.selectLayoutHeader(), m.centerView(), m.footerView())
+	}
 	header := lipgloss.NewStyle().Bold(true).Foreground(theme.ColorPrimary).Render(renderTitle())
 	footer := m.footerView()
 	available := m.bodyHeight()
@@ -790,13 +849,19 @@ func (m *workspaceModel) footerView() string {
 func (m *workspaceModel) hintsView() string {
 	if m.focus == panelChat && m.chat != nil && m.chat.mode == modeSelect {
 		return theme.DimStyle().Render(
-			"move: ↑↓ jk g G  fold: enter, space  fold all: o  composer: esc, i, ctrl+g")
+			"move: ↑↓ jk g G  fold: enter, space  fold all: o  copy: y entry, Y all  export: e  composer: esc, i, ctrl+g")
 	}
-	hints := "navigate: ↑↓  focus: click, tab or 0-4  search: /  enter: drill down, open  refresh: ctrl+r  details: ctrl+d  fold output: ctrl+o  select: ctrl+g  quit: ctrl+c"
-	if m.focus == panelChat && m.chat != nil && m.chat.isStreaming() {
-		hints = "cancel: esc esc  " + hints
+	if m.selectLayout {
+		return theme.DimStyle().Render("select: ctrl+g  copy answer: ctrl+y  fold output: ctrl+o  layout: ctrl+l  quit: ctrl+c")
 	}
-	return theme.DimStyle().Render(hints)
+	// Each line is short enough to fit a normal terminal, so it names only the keys that act here.
+	if m.focus == panelChat && m.chat != nil {
+		if m.chat.isStreaming() {
+			return theme.DimStyle().Render("cancel: esc esc  select: ctrl+g  copy answer: ctrl+y  fold output: ctrl+o  quit: ctrl+c")
+		}
+		return theme.DimStyle().Render("send: enter  select: ctrl+g  copy answer: ctrl+y  fold output: ctrl+o  panels: tab  quit: ctrl+c")
+	}
+	return theme.DimStyle().Render("move: ↑↓  focus: tab, 0-4  search: /  open: enter  refresh: ctrl+r  details: ctrl+d  quit: ctrl+c")
 }
 
 // renderTitle returns the styled header line.

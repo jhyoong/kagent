@@ -9,6 +9,8 @@ import (
 
 	a2atype "github.com/a2aproject/a2a-go/v2/a2a"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	kagenta2a "github.com/kagent-dev/kagent/go/api/a2a"
 	apiv1alpha1 "github.com/kagent-dev/kagent/go/api/gen/kagent/api/v1alpha1"
 	clia2a "github.com/kagent-dev/kagent/go/core/cli/internal/a2a"
@@ -814,4 +816,25 @@ func TestWorkspaceDigitsSwitchPanelsWithoutAChat(t *testing.T) {
 	m.Update(runes("3"))
 
 	assert.Equal(t, panelID(3), m.focus)
+}
+
+func TestWorkspaceHintsFitAndFollowFocus(t *testing.T) {
+	m := openedChat(t)
+
+	m.focus = panelChat
+	composer := ansi.Strip(m.hintsView())
+	m.chat.turn = &streamingTurn{}
+	streaming := ansi.Strip(m.hintsView())
+	m.chat.turn = idleTurn{}
+	m.focus = panelSessions
+	panels := ansi.Strip(m.hintsView())
+
+	for name, hints := range map[string]string{"composer": composer, "streaming": streaming, "panels": panels} {
+		assert.LessOrEqual(t, lipgloss.Width(hints), 100, name)
+	}
+	assert.Contains(t, composer, "ctrl+y")
+	assert.Contains(t, composer, "ctrl+g")
+	assert.Contains(t, streaming, "esc esc")
+	assert.NotContains(t, panels, "ctrl+y")
+	assert.Contains(t, panels, "ctrl+r")
 }
