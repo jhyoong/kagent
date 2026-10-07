@@ -262,7 +262,7 @@ func (m *workspaceModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		for _, task := range msg.tasks {
-			m.chat.AppendHistoryTask(task)
+			m.chat.appendHistoryTask(task)
 		}
 		// Tasks are sorted oldest first, so the last is the most recent thing this session did.
 		if last := len(msg.tasks) - 1; last >= 0 && msg.tasks[last] != nil && msg.tasks[last].Status.Timestamp != nil {

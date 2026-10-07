@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -17,25 +18,13 @@ import (
 	clia2a "github.com/kagent-dev/kagent/go/core/cli/internal/a2a"
 	sessionview "github.com/kagent-dev/kagent/go/core/cli/internal/tui/session"
 	"github.com/kagent-dev/kagent/go/core/cli/internal/tui/theme"
-	"github.com/muesli/reflow/wordwrap"
+	"github.com/kagent-dev/kagent/go/core/cli/internal/tui/transcript"
 )
 
 // SendMessageFn abstracts the A2A client's SendStreamingMessage method for easier testing.
 type SendMessageFn func(ctx context.Context, req *a2atype.SendMessageRequest) <-chan clia2a.StreamResult
 
 type streamDoneMsg struct{}
-
-type toolCall struct {
-	Name string `json:"name"`
-	ID   string `json:"id"`
-	Args any    `json:"args"`
-}
-
-type toolResult struct {
-	Name     string `json:"name"`
-	ID       string `json:"id"`
-	Response any    `json:"response"`
-}
 
 type chatModel struct {
 	agentRef  string
@@ -48,9 +37,13 @@ type chatModel struct {
 	vp    viewport.Model
 	input textarea.Model
 
-	// agentText is the trailing block still being assembled, committed into history before anything else.
-	history   string
-	agentText string
+	// entries is the conversation. When textOpen, the last entry is the AgentText still being
+	// assembled; appending anything else closes it.
+	entries  []transcript.Entry
+	textOpen bool
+	// turnStart is where the current turn's entries begin. Call IDs repeat across turns, so
+	// tool activity pairs and Visible filters only within a turn; earlier entries are sealed.
+	turnStart int
 
 	// projected is the assembler's last text projection, so cumulative chunks yield a delta not a duplicate.
 	assembler *clia2a.Assembler
@@ -232,6 +225,7 @@ func (m *chatModel) headerView(width int) string {
 }
 
 func (m *chatModel) submit(text string) tea.Cmd {
+	m.sealTurn()
 	m.streaming = true
 	m.assembler = &clia2a.Assembler{}
 	m.projected = ""
@@ -264,7 +258,7 @@ func (m *chatModel) waitNext() tea.Cmd {
 
 // endStream commits any in-flight agent text and clears the working state.
 func (m *chatModel) endStream() {
-	m.commitAgentText()
+	m.textOpen = false
 	m.streaming = false
 	m.working = false
 	m.lastActive = time.Now()
@@ -280,7 +274,7 @@ func (m *chatModel) appendEvent(ev a2atype.Event) {
 		m.assembler = &clia2a.Assembler{}
 	}
 	if err := m.assembler.Apply(ev); err != nil {
-		m.appendLine(theme.ErrorStyle().Render(fmt.Sprintf("Protocol error: %v", err)))
+		m.appendEntry(transcript.Banner{Kind: transcript.BannerError, Text: fmt.Sprintf("Protocol error: %v", err)})
 		return
 	}
 	m.renderToolActivity(eventParts(ev))
@@ -316,14 +310,21 @@ func (m *chatModel) renderAssembledText() {
 		return
 	}
 	delta, extends := strings.CutPrefix(text, m.projected)
-	if extends {
-		m.agentText += delta
-	} else {
-		m.commitAgentText()
-		m.agentText = text
-	}
 	m.projected = text
-	m.render()
+	if extends && m.textOpen {
+		last := len(m.entries) - 1
+		if open, ok := m.entries[last].(transcript.AgentText); ok {
+			open.Text += delta
+			m.entries[last] = open
+			m.render()
+			return
+		}
+	}
+	if extends {
+		text = delta
+	}
+	m.appendEntry(transcript.AgentText{Text: text})
+	m.textOpen = true
 }
 
 // assembledText projects agent output; only artifacts carry it, status messages are control-plane.
@@ -366,9 +367,9 @@ func (m *chatModel) renderState() {
 	switch state {
 	// The gateway rejects a message carrying a TaskID, so a reply starts a new task rather than resuming.
 	case a2atype.TaskStateInputRequired:
-		m.appendLine(theme.StatusStyle().Render("⏸ Input required. Resuming a paused task is not supported yet; a reply starts a new one."))
+		m.appendEntry(transcript.Banner{Kind: transcript.BannerInfo, Text: "⏸ Input required. Resuming a paused task is not supported yet; a reply starts a new one."})
 	case a2atype.TaskStateAuthRequired:
-		m.appendLine(theme.StatusStyle().Render("⏸ Authentication required. This task cannot continue here."))
+		m.appendEntry(transcript.Banner{Kind: transcript.BannerInfo, Text: "⏸ Authentication required. This task cannot continue here."})
 	case a2atype.TaskStateFailed, a2atype.TaskStateRejected, a2atype.TaskStateCanceled:
 		banner := fmt.Sprintf("✗ Task %s.", state)
 		if task.Status.Message != nil {
@@ -379,7 +380,7 @@ func (m *chatModel) renderState() {
 				banner += " " + detail
 			}
 		}
-		m.appendLine(theme.ErrorStyle().Render(banner))
+		m.appendEntry(transcript.Banner{Kind: transcript.BannerError, Text: banner})
 	}
 	if state.Terminal() || state == a2atype.TaskStateInputRequired || state == a2atype.TaskStateAuthRequired {
 		m.working = false
@@ -389,152 +390,84 @@ func (m *chatModel) renderState() {
 	}
 }
 
-// AppendHistoryTask renders a past task: its user messages, then its output.
-func (m *chatModel) AppendHistoryTask(task *a2atype.Task) {
-	if task == nil {
-		return
-	}
-	for _, msg := range task.History {
-		if msg == nil || msg.Role != a2atype.MessageRoleUser {
-			continue
-		}
-		text, err := clia2a.PartsText(msg.Parts)
-		if err != nil {
-			m.appendTransportError(err)
-			continue
-		}
-		if strings.TrimSpace(text) != "" {
-			m.appendUser(text)
-		}
-	}
-	text, err := assembledText(task)
-	if err != nil {
-		m.appendTransportError(err)
-		return
-	}
-	if strings.TrimSpace(text) != "" {
-		m.appendLine(theme.AgentStyle().Render("Agent:") + "\n" + text)
-	}
+// appendHistoryTask replays a past task as it happened, tool activity included.
+// ProjectTask already applies Visible within the task, so it arrives sealed.
+func (m *chatModel) appendHistoryTask(task *a2atype.Task) {
+	m.sealTurn()
+	m.entries = append(m.entries, transcript.ProjectTask(task)...)
+	m.turnStart = len(m.entries)
+	m.render()
+}
+
+// sealTurn fixes the current turn's entries as shown and starts a new turn after them.
+func (m *chatModel) sealTurn() {
+	m.textOpen = false
+	m.entries = append(m.entries[:m.turnStart], transcript.Visible(m.entries[m.turnStart:])...)
+	m.turnStart = len(m.entries)
 }
 
 func (m *chatModel) appendUser(text string) {
-	m.appendLine(theme.UserStyle().Render("You:") + " " + text)
+	m.appendEntry(transcript.UserMessage{Text: text})
 }
 
 // appendTransportError reports a stream failure, distinct from a task the agent itself failed.
 func (m *chatModel) appendTransportError(err error) {
-	m.appendLine(theme.ErrorStyle().Render(fmt.Sprintf("Connection error: %v", err)))
+	m.appendEntry(transcript.Banner{Kind: transcript.BannerError, Text: fmt.Sprintf("Connection error: %v", err)})
 }
 
-// renderToolActivity shows kagent data parts; the reducer has no opinion about them.
+// renderToolActivity folds kagent tool data parts into the transcript; the reducer has no opinion about them.
 func (m *chatModel) renderToolActivity(parts a2atype.ContentParts) {
-	var calls []toolCall
-	var results []toolResult
-
+	changed := false
 	for _, part := range parts {
-		if part == nil {
+		if part == nil || part.Data() == nil {
 			continue
 		}
-		data := part.Data()
-		if data == nil {
-			continue
-		}
-
 		if m.verbose {
 			if metaJSON, err := json.Marshal(part.Metadata); err == nil {
-				m.appendLine(theme.DimStyle().Render(fmt.Sprintf("DEBUG: DataPart metadata: %s", string(metaJSON))))
+				m.appendEntry(transcript.Banner{Kind: transcript.BannerInfo, Text: fmt.Sprintf("DEBUG: DataPart metadata: %s", metaJSON)})
 			}
-			if dataJSON, err := json.Marshal(data); err == nil {
-				m.appendLine(theme.DimStyle().Render(fmt.Sprintf("DEBUG: DataPart data: %s", string(dataJSON))))
+			if dataJSON, err := json.Marshal(part.Data()); err == nil {
+				m.appendEntry(transcript.Banner{Kind: transcript.BannerInfo, Text: fmt.Sprintf("DEBUG: DataPart data: %s", dataJSON)})
 			}
 		}
-
 		activity, ok := kagenta2a.ParseToolActivity(part)
 		if !ok {
 			continue
 		}
-
-		switch activity.Kind {
-		case kagenta2a.ToolCallKind:
-			calls = append(calls, toolCall{
-				Name: activity.Name,
-				ID:   activity.ID,
-				Args: activity.Args,
-			})
-		case kagenta2a.ToolResultKind:
-			results = append(results, toolResult{
-				Name:     activity.Name,
-				ID:       activity.ID,
-				Response: activity.Response,
-			})
+		before := len(m.entries)
+		// Clipped so an appended entry cannot alias the turn into the sealed entries' array.
+		turn := transcript.ApplyToolActivity(slices.Clip(m.entries[m.turnStart:]), activity)
+		m.entries = append(m.entries[:m.turnStart], turn...)
+		if len(m.entries) > before {
+			m.textOpen = false // a new entry follows the text being assembled
 		}
+		changed = true
 	}
-
-	for _, call := range calls {
-		display := theme.ToolCallStyle().Render(fmt.Sprintf("🔧 Tool Call: %s", call.Name))
-		if call.ID != "" {
-			display += theme.DimStyle().Render(fmt.Sprintf(" (id: %s)", call.ID))
-		}
-		if args := indentJSON(call.Args); args != "" {
-			display += "\n" + theme.DimStyle().Render(args)
-		}
-		m.appendLine(display)
-	}
-	for _, result := range results {
-		display := theme.ToolResultStyle().Render(fmt.Sprintf("📊 Tool Result: %s", result.Name))
-		if result.ID != "" {
-			display += theme.DimStyle().Render(fmt.Sprintf(" (id: %s)", result.ID))
-		}
-		if response := indentJSON(result.Response); response != "" {
-			display += "\n" + response
-		}
-		m.appendLine(display)
+	if changed {
+		m.render()
 	}
 }
 
-func indentJSON(value any) string {
-	if value == nil {
-		return ""
-	}
-	encoded, err := json.MarshalIndent(value, "", "  ")
-	if err != nil {
-		return fmt.Sprintf("%v", value)
-	}
-	return string(encoded)
-}
-
-// commitAgentText closes the in-flight block so another can follow it.
-func (m *chatModel) commitAgentText() {
-	if m.agentText == "" {
-		return
-	}
-	m.history = joinBlocks(m.history, theme.AgentStyle().Render("Agent:")+"\n"+m.agentText)
-	m.agentText = ""
-}
-
-func (m *chatModel) appendLine(s string) {
-	m.commitAgentText()
-	m.history = joinBlocks(m.history, s)
+// appendEntry adds an entry after everything shown, closing the text being assembled.
+func (m *chatModel) appendEntry(entry transcript.Entry) {
+	m.textOpen = false
+	m.entries = append(m.entries, entry)
 	m.render()
 }
 
-func joinBlocks(history, block string) string {
-	if history == "" {
-		return block
-	}
-	return history + "\n\n" + block
+// visibleEntries is what the transcript shows: sealed entries as they are, the current turn filtered.
+func (m *chatModel) visibleEntries() []transcript.Entry {
+	return append(slices.Clip(m.entries[:m.turnStart]), transcript.Visible(m.entries[m.turnStart:])...)
 }
 
-// render redraws the viewport, wrapping to the current width.
+// render redraws the viewport at its width; entries wrap themselves.
 func (m *chatModel) render() {
-	content := m.history
-	if m.agentText != "" {
-		content = joinBlocks(content, theme.AgentStyle().Render("Agent:")+"\n"+m.agentText)
+	visible := m.visibleEntries()
+	blocks := make([]string, 0, len(visible))
+	for _, entry := range visible {
+		blocks = append(blocks, transcript.Render(entry, m.vp.Width, false, false))
 	}
-	if m.vp.Width > 2 {
-		content = wordwrap.String(content, m.vp.Width-2) // -2 for padding
-	}
-	m.vp.SetContent(content)
+	m.vp.SetContent(strings.Join(blocks, "\n\n"))
 	m.vp.GotoBottom()
 }
 

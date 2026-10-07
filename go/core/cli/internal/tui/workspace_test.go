@@ -487,14 +487,14 @@ func TestWorkspaceIgnoresHistoryForAnotherSession(t *testing.T) {
 	m := testWorkspace(t, &fakeLister{pages: []*apiv1alpha1.ListSessionsResponse{page("", first, second)}})
 	loaded(m)
 	m.selectSession(second)
-	before := transcript(m.chat)
+	before := shownText(m.chat)
 
 	m.Update(sessionHistoryLoadedMsg{
 		sessionID: first.GetId(),
 		tasks:     []*a2atype.Task{{ID: "t", Status: a2atype.TaskStatus{State: a2atype.TaskStateCompleted}}},
 	})
 
-	assert.Equal(t, before, transcript(m.chat), "history for another session is dropped")
+	assert.Equal(t, before, shownText(m.chat), "history for another session is dropped")
 }
 
 func TestWorkspaceStopsTheOutgoingStreamOnSwitch(t *testing.T) {
@@ -552,7 +552,7 @@ func TestWorkspaceRoutesStreamMessagesRegardlessOfFocus(t *testing.T) {
 
 	m.Update(clia2a.StreamResult{Err: errors.New("stream disconnected")})
 
-	assert.Contains(t, transcript(m.chat), "Connection error")
+	assert.Contains(t, shownText(m.chat), "Connection error")
 }
 
 func TestWorkspaceRefreshDropsADeletedSession(t *testing.T) {

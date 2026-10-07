@@ -37,7 +37,6 @@ require (
 	github.com/kagent-dev/mockllm v0.1.0
 	github.com/kagent-dev/mockmcp v0.0.0-20260520211643-dcd475b74085
 	github.com/modelcontextprotocol/go-sdk v1.8.0
-	github.com/muesli/reflow v0.3.0
 	github.com/ollama/ollama v0.34.4
 	github.com/openai/openai-go/v3 v3.66.0
 	github.com/pelletier/go-toml/v2 v2.4.3

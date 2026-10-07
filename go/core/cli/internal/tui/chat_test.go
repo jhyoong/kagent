@@ -3,13 +3,17 @@ package tui
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	a2atype "github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
+	tea "github.com/charmbracelet/bubbletea"
 	kagenta2a "github.com/kagent-dev/kagent/go/api/a2a"
 	clia2a "github.com/kagent-dev/kagent/go/core/cli/internal/a2a"
+	"github.com/kagent-dev/kagent/go/core/cli/internal/tui/transcript"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func newTestChatModel() *chatModel {
@@ -21,12 +25,14 @@ func newTestChatModel() *chatModel {
 	return newChatModel(context.Background(), "reporter", "ctx-1", send, false)
 }
 
-// transcript is everything the viewport shows: committed blocks plus the one being assembled.
-func transcript(m *chatModel) string {
-	if m.agentText == "" {
-		return m.history
+// shownText is the visible transcript as plain text, including the block being assembled.
+func shownText(m *chatModel) string {
+	visible := m.visibleEntries()
+	blocks := make([]string, 0, len(visible))
+	for _, entry := range visible {
+		blocks = append(blocks, transcript.PlainText(entry))
 	}
-	return m.history + "\n\n" + m.agentText
+	return strings.Join(blocks, "\n\n")
 }
 
 func reqCtx() *a2asrv.ExecutorContext {
@@ -93,8 +99,8 @@ func TestChatModelStreamsAssembledText(t *testing.T) {
 				model.appendEvent(event)
 			}
 
-			assert.Contains(t, transcript(model), tt.want)
-			assert.NotContains(t, transcript(model), tt.wantAbsent)
+			assert.Contains(t, shownText(model), tt.want)
+			assert.NotContains(t, shownText(model), tt.wantAbsent)
 		})
 	}
 }
@@ -160,10 +166,10 @@ func TestChatModelRendersStateClasses(t *testing.T) {
 			tt.apply(model)
 
 			if tt.want != "" {
-				assert.Contains(t, transcript(model), tt.want)
+				assert.Contains(t, shownText(model), tt.want)
 			}
 			if tt.wantAbsent != "" {
-				assert.NotContains(t, transcript(model), tt.wantAbsent)
+				assert.NotContains(t, shownText(model), tt.wantAbsent)
 			}
 			assert.False(t, model.working, "a settled task stops the working indicator")
 		})
@@ -172,35 +178,116 @@ func TestChatModelRendersStateClasses(t *testing.T) {
 
 func TestChatModelRendersToolActivityBeforeLastChunk(t *testing.T) {
 	model := newTestChatModel()
+	model.Update(tea.WindowSizeMsg{Width: 80, Height: 20})
 
+	model.appendEvent(a2atype.NewArtifactEvent(reqCtx(), a2atype.NewTextPart("checking")))
 	model.appendEvent(a2atype.NewArtifactEvent(reqCtx(),
 		dataPart("function_call", "get_pods", map[string]any{"args": map[string]any{"namespace": "default"}})))
 	model.appendEvent(a2atype.NewArtifactEvent(reqCtx(),
 		dataPart("function_response", "get_pods", map[string]any{"response": map[string]any{"pods": []any{"pod-a"}}})))
 
-	got := transcript(model)
-	assert.Contains(t, got, "Tool Call: get_pods")
-	assert.Contains(t, got, "Tool Result: get_pods")
-	assert.Contains(t, got, "pod-a")
+	assert.Equal(t, []transcript.Entry{
+		transcript.AgentText{Text: "checking"},
+		transcript.ToolActivity{
+			ID: "call-1", Name: "get_pods",
+			Args:    map[string]any{"namespace": "default"},
+			Outcome: transcript.Returned{Response: map[string]any{"pods": []any{"pod-a"}}},
+		},
+	}, model.entries, "the result settles its call in place")
+	assert.Contains(t, model.vp.View(), "▸ ✓ get_pods", "collapsed by default")
+}
+
+// A tool entry closes the text block, so text after it is a new block rather than an edit above it.
+func TestChatModelTextAfterToolActivityIsANewBlock(t *testing.T) {
+	model := newTestChatModel()
+
+	first := a2atype.NewArtifactEvent(reqCtx(), a2atype.NewTextPart("before"))
+	model.appendEvent(first)
+	model.appendEvent(a2atype.NewArtifactEvent(reqCtx(), dataPart("function_call", "get_pods", map[string]any{})))
+	model.appendEvent(a2atype.NewArtifactUpdateEvent(reqCtx(), first.Artifact.ID, a2atype.NewTextPart(" after")))
+
+	assert.Equal(t, []transcript.Entry{
+		transcript.AgentText{Text: "before"},
+		transcript.ToolActivity{ID: "call-1", Name: "get_pods", Outcome: transcript.Running{}},
+		transcript.AgentText{Text: " after"},
+	}, model.entries)
 }
 
 func TestChatModelAppendsHistoryTask(t *testing.T) {
 	model := newTestChatModel()
 
-	model.AppendHistoryTask(&a2atype.Task{
+	model.appendHistoryTask(&a2atype.Task{
 		ID: "task-1", ContextID: "ctx-1",
 		Status: a2atype.TaskStatus{State: a2atype.TaskStateCompleted},
 		History: []*a2atype.Message{
-			a2atype.NewMessage(a2atype.MessageRoleUser, a2atype.NewTextPart("what is 2+2?")),
-			a2atype.NewMessage(a2atype.MessageRoleAgent, a2atype.NewTextPart("echoed agent turn")),
+			a2atype.NewMessage(a2atype.MessageRoleUser, a2atype.NewTextPart("what pods?")),
+			a2atype.NewMessage(a2atype.MessageRoleAgent, a2atype.NewTextPart("There is one pod.")),
 		},
-		Artifacts: []*a2atype.Artifact{{
-			ID: "artifact-1", Parts: a2atype.ContentParts{a2atype.NewTextPart("The answer is 4.")},
-		}},
+		Artifacts: []*a2atype.Artifact{
+			{ID: "call", Parts: a2atype.ContentParts{dataPart("function_call", "get_pods", map[string]any{"args": map[string]any{}})}},
+			{ID: "result", Parts: a2atype.ContentParts{dataPart("function_response", "get_pods", map[string]any{"response": "pod-a"})}},
+			{ID: "reply", Parts: a2atype.ContentParts{a2atype.NewTextPart("There is one pod.")}},
+		},
 	})
 
-	got := transcript(model)
-	assert.Contains(t, got, "what is 2+2?")
-	assert.Contains(t, got, "The answer is 4.")
-	assert.NotContains(t, got, "echoed agent turn", "agent output comes from artifacts, not history messages")
+	got := shownText(model)
+	assert.Contains(t, got, "what pods?")
+	assert.Contains(t, got, "✓ get_pods", "history shows tool activity")
+	assert.Equal(t, 1, strings.Count(got, "There is one pod."), "an artifact repeating history text is one reply")
+}
+
+func historyTask(id string, history []*a2atype.Message, artifacts ...*a2atype.Artifact) *a2atype.Task {
+	return &a2atype.Task{
+		ID: a2atype.TaskID(id), ContextID: "ctx-1",
+		Status:    a2atype.TaskStatus{State: a2atype.TaskStateCompleted},
+		History:   history,
+		Artifacts: artifacts,
+	}
+}
+
+// Models reuse call IDs across turns; a new turn's call must not update an older entry.
+func TestChatModelRepeatedCallIDStartsANewEntry(t *testing.T) {
+	model := newTestChatModel()
+	model.appendHistoryTask(historyTask("task-0", nil,
+		&a2atype.Artifact{ID: "call", Parts: a2atype.ContentParts{dataPart("function_call", "get_pods", map[string]any{"args": map[string]any{}})}},
+		&a2atype.Artifact{ID: "result", Parts: a2atype.ContentParts{dataPart("function_response", "get_pods", map[string]any{"response": "old"})}},
+	))
+	old := model.entries[0]
+
+	model.appendUser("again")
+	model.submit("again")
+	model.appendEvent(a2atype.NewArtifactEvent(reqCtx(), a2atype.NewTextPart("checking")))
+	model.appendEvent(a2atype.NewArtifactEvent(reqCtx(), dataPart("function_call", "get_pods", map[string]any{})))
+	model.appendEvent(a2atype.NewArtifactEvent(reqCtx(), dataPart("function_response", "get_pods", map[string]any{"response": "new"})))
+
+	assert.Equal(t, []transcript.Entry{
+		old,
+		transcript.UserMessage{Text: "again"},
+		transcript.AgentText{Text: "checking"},
+		transcript.ToolActivity{ID: "call-1", Name: "get_pods", Outcome: transcript.Returned{Response: "new"}},
+	}, model.entries)
+	assert.False(t, model.textOpen, "the new tool entry closes the text block")
+}
+
+// A rejection recorded in an earlier task does not explain a later refusal.
+func TestChatModelEarlierRejectionDoesNotHideLaterNotRun(t *testing.T) {
+	model := newTestChatModel()
+	request := a2atype.NewMessage(a2atype.MessageRoleAgent, a2atype.NewTextPart("approve?"))
+	require.NoError(t, kagenta2a.AttachHITL(request, kagenta2a.ToolApprovalRequest{
+		Type:  kagenta2a.HITLTypeToolApprovalRequest,
+		Tools: []kagenta2a.HITLTool{{ID: "approval-1", Name: "delete_pod"}},
+	}))
+	response := a2atype.NewMessage(a2atype.MessageRoleUser, a2atype.NewTextPart("Rejected"))
+	require.NoError(t, kagenta2a.AttachHITL(response, kagenta2a.ToolApprovalResponse{
+		Type:      kagenta2a.HITLTypeToolApprovalResponse,
+		Approvals: []kagenta2a.ToolApproval{{ID: "approval-1"}},
+	}))
+	model.appendHistoryTask(historyTask("task-0", []*a2atype.Message{request, response}))
+
+	model.appendUser("try again")
+	model.submit("try again")
+	model.appendEvent(a2atype.NewArtifactEvent(reqCtx(), dataPart("function_response", "delete_pod",
+		map[string]any{"response": map[string]any{"error": `error tool "delete_pod" call is rejected`}})))
+
+	assert.Contains(t, shownText(model), "⊘ delete_pod")
 }
